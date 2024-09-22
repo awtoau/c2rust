@@ -1,14 +1,23 @@
-use crate::volatile::rust_entry3;
+use crate::volatile::{rust_entry3, rust_volatile_stuff};
 use std::ffi::{c_int, c_uint};
 
 #[link(name = "test")]
 unsafe extern "C" {
+    fn volatile_stuff();
+
     fn entry3(_: c_uint, _: *mut c_int);
 }
 
 const BUFFER_SIZE: usize = 9;
 
 #[test]
+pub fn test_compiles() {
+    unsafe {
+        volatile_stuff();
+        rust_volatile_stuff();
+    }
+}
+
 pub fn test_buffer() {
     let mut buffer = [0; BUFFER_SIZE];
     let mut rust_buffer = [0; BUFFER_SIZE];

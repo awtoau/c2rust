@@ -731,7 +731,7 @@ impl<'c> Translation<'c> {
                 };
 
                 let val = WithStmts::new(
-                    vec![save_old_val, mk().expr_stmt(assign_stmt)],
+                    vec![save_old_val, mk().semi_stmt(assign_stmt)],
                     mk().ident_expr(val_name),
                 )
                 .merge_unsafe(is_unsafe);
