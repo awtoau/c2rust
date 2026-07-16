@@ -405,6 +405,15 @@ pub fn immediate_children_all_types(context: &TypedAstContext, s_or_e: SomeId) -
 pub struct DFExpr<'context> {
     context: &'context TypedAstContext,
     stack: Vec<SomeId>,
+    // Nodes already pushed onto (or popped from) the stack, so we don't re-expand
+    // the same subtree every time it's reached via a different parent. Without this,
+    // nodes that are shared by many parents (most commonly `CTypeId`s, which are
+    // interned/deduplicated and so are referenced from many casts/decls/exprs across
+    // a translation unit) get their entire subtree re-walked once per incoming
+    // reference. For a large, frequently-referenced type (e.g. a big kernel struct)
+    // reached from many call sites, this turns an otherwise-linear traversal into
+    // a combinatorial blow-up. See c2rust-transpile#<issue>.
+    visited: HashSet<SomeId>,
 }
 
 impl<'context> DFExpr<'context> {
@@ -412,6 +421,7 @@ impl<'context> DFExpr<'context> {
         DFExpr {
             context,
             stack: vec![start],
+            visited: <_>::from([start]),
         }
     }
     pub fn prune(&mut self, n: usize) {
@@ -428,8 +438,15 @@ impl<'context> Iterator for DFExpr<'context> {
         if let Some(i) = result {
             // Compute list of immediate children
             let children = immediate_children(self.context, i);
-            // Add children in reverse order since we visit the end of the stack first
-            self.stack.extend(children.into_iter().rev())
+            // Add children in reverse order since we visit the end of the stack first,
+            // skipping any node we've already queued/visited so shared subtrees (most
+            // notably interned types referenced from many places) are only walked once.
+            self.stack.extend(
+                children
+                    .into_iter()
+                    .rev()
+                    .filter(|child| self.visited.insert(*child)),
+            )
         }
 
         result
