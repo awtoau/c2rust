@@ -401,11 +401,24 @@ private:
         auto kind = T->getKind();
 
 #if CLANG_VERSION_MAJOR >= 10
-        // Handle built-in vector types as if they're normal vector types
-        if (kind >= BuiltinType::SveInt8 && kind <= BuiltinType::SveBool
+        // Handle built-in vector types as if they're normal vector types.
+        //
+        // Use Type::isSVESizelessBuiltinType()/isRVVSizelessBuiltinType()
+        // (stable Clang APIs added for exactly this purpose) instead of
+        // hand-maintained BuiltinType::Kind enum ranges: those ranges
+        // silently go stale every time Clang adds new vector-tuple/
+        // segment-load kinds to the END of the Rvv*/Sve* enum block
+        // (e.g. Clang 22 added dozens of RvvBFloat16*/RvvFloat64*x*
+        // tuple kinds after RvvBool64), which previously fell through to
+        // the `default:` case below and produced a `TagTypeUnknown` that
+        // c2rust-transpile's conversion.rs has no match arm for and
+        // panics on — see awtoau/c2rust#1, upstream immunant/c2rust#692
+        // (original RVV report, fixed by #693) and #1209/#1235 (the
+        // same panic, for __float128, fixed by widening BuiltinType
+        // coverage the same way this change does more durably).
+        if (T->isSVESizelessBuiltinType()
 #if CLANG_VERSION_MAJOR >= 13
-            /* RISC-V vector types */
-            || kind >= BuiltinType::RvvInt8mf8 && kind <= BuiltinType::RvvBool64
+            || T->isRVVSizelessBuiltinType()
 #endif // CLANG_VERSION_MAJOR >= 13
             ) {
 // Declare ElemType and ElemCount as needed by various Clang versions
