@@ -1612,61 +1612,88 @@ impl CfgBuilder {
                 body: body_stmt,
                 condition,
             } => {
-                let body_entry = self.fresh_label();
-                let cond_entry = self.fresh_label();
-                let next_entry = self.fresh_label();
-
-                self.add_wip_block(wip, Jump(body_entry.clone()));
-                self.open_loop();
-
-                // Body
-                let saw_unmatched_break = self.last_per_stmt_mut().saw_unmatched_break;
-                let saw_unmatched_continue = self.last_per_stmt_mut().saw_unmatched_continue;
-                self.break_labels.push(next_entry.clone());
-                self.continue_labels.push(cond_entry.clone());
-
-                let body_stuff = self.convert_stmt_help(
-                    translator,
-                    ctx,
-                    body_stmt,
-                    None,
-                    body_entry.clone(),
-                    ret_ty,
-                )?;
-                if let Some(body_end) = body_stuff {
-                    let wip_body = self.new_wip_block(body_end);
-                    self.add_wip_block(wip_body, Jump(cond_entry.clone()));
-                }
-
-                self.last_per_stmt_mut().saw_unmatched_break = saw_unmatched_break;
-                self.last_per_stmt_mut().saw_unmatched_continue = saw_unmatched_continue;
-                self.break_labels.pop();
-                self.continue_labels.pop();
-
-                // Condition
-                let (stmts, val) = translator
-                    .convert_condition(ctx, true, condition)?
-                    .discard_unsafe();
-                let cond_val = translator
+                // `swap(a, b)` expands to `do { typeof(a) __tmp = (a); (a) =
+                // (b); (b) = __tmp; } while (0)`: a `do{}while(0)` loop is
+                // the only shape this macro produces, so restricting to a
+                // literal-zero condition (in addition to `swap_operands`'s
+                // own structural check on the body) keeps this from ever
+                // firing on a real loop that happens to share the body shape.
+                let condition_is_literal_zero = translator
                     .ast_context
                     .index_unwrap_parens(condition)
                     .kind
-                    .get_bool();
-                let mut cond_wip = self.new_wip_block(cond_entry);
-                cond_wip.extend(stmts);
-                self.add_wip_block(
-                    cond_wip,
-                    match cond_val {
-                        Some(true) => Jump(body_entry),
-                        Some(false) => Jump(next_entry.clone()),
-                        None => Branch(val, body_entry, next_entry.clone()),
-                    },
-                );
+                    .get_bool()
+                    == Some(false);
+                let swap_operands = condition_is_literal_zero
+                    .then(|| translator.swap_operands(body_stmt))
+                    .flatten();
 
-                self.close_loop();
+                if let Some((a_id, b_id)) = swap_operands {
+                    // Recognized `swap(a, b)` expansion: emit the two operands'
+                    // `core::mem::swap` call directly into the current block
+                    // instead of building loop control-flow for it, exactly
+                    // like the plain-statement fast path `CStmtKind::Expr`
+                    // uses below for other single-statement macro bodies.
+                    let swap_stmts = translator.convert_swap(ctx, a_id, b_id)?;
+                    wip.extend(swap_stmts);
+                    Ok(Some(wip))
+                } else {
+                    let body_entry = self.fresh_label();
+                    let cond_entry = self.fresh_label();
+                    let next_entry = self.fresh_label();
 
-                //Return
-                Ok(Some(self.new_wip_block(next_entry)))
+                    self.add_wip_block(wip, Jump(body_entry.clone()));
+                    self.open_loop();
+
+                    // Body
+                    let saw_unmatched_break = self.last_per_stmt_mut().saw_unmatched_break;
+                    let saw_unmatched_continue = self.last_per_stmt_mut().saw_unmatched_continue;
+                    self.break_labels.push(next_entry.clone());
+                    self.continue_labels.push(cond_entry.clone());
+
+                    let body_stuff = self.convert_stmt_help(
+                        translator,
+                        ctx,
+                        body_stmt,
+                        None,
+                        body_entry.clone(),
+                        ret_ty,
+                    )?;
+                    if let Some(body_end) = body_stuff {
+                        let wip_body = self.new_wip_block(body_end);
+                        self.add_wip_block(wip_body, Jump(cond_entry.clone()));
+                    }
+
+                    self.last_per_stmt_mut().saw_unmatched_break = saw_unmatched_break;
+                    self.last_per_stmt_mut().saw_unmatched_continue = saw_unmatched_continue;
+                    self.break_labels.pop();
+                    self.continue_labels.pop();
+
+                    // Condition
+                    let (stmts, val) = translator
+                        .convert_condition(ctx, true, condition)?
+                        .discard_unsafe();
+                    let cond_val = translator
+                        .ast_context
+                        .index_unwrap_parens(condition)
+                        .kind
+                        .get_bool();
+                    let mut cond_wip = self.new_wip_block(cond_entry);
+                    cond_wip.extend(stmts);
+                    self.add_wip_block(
+                        cond_wip,
+                        match cond_val {
+                            Some(true) => Jump(body_entry),
+                            Some(false) => Jump(next_entry.clone()),
+                            None => Branch(val, body_entry, next_entry.clone()),
+                        },
+                    );
+
+                    self.close_loop();
+
+                    //Return
+                    Ok(Some(self.new_wip_block(next_entry)))
+                }
             }
 
             CStmtKind::ForLoop {

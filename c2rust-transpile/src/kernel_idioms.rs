@@ -44,6 +44,14 @@ pub enum KernelIdiomRule {
     /// `leading_zeros()`/`trailing_zeros()`-based one-line body instead of
     /// transliterating the header's byte-at-a-time scan loop.
     FlsFamily,
+
+    /// Recognize the expansion of the kernel's `swap(a, b)` macro (matched
+    /// by the shape of its `do{}while(0)` body — macro-origin data isn't
+    /// available here, since Clang's AST exporter only records it for
+    /// expressions, not statements) and emit `core::mem::swap(&mut a, &mut
+    /// b)` instead of transliterating the `typeof(a) __tmp = (a); (a) =
+    /// (b); (b) = __tmp;` temp-variable dance.
+    SwapMemSwap,
 }
 
 /// The active set of [`KernelIdiomRule`]s for one transpile run.

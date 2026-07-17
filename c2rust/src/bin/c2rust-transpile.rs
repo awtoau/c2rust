@@ -298,9 +298,10 @@ fn main() {
         .map(|s| {
             parse_rule_list(s).unwrap_or_else(|e| {
                 panic!(
-                    "invalid --enable-rule value {s:?}: {e} (known rules: {}, {})",
+                    "invalid --enable-rule value {s:?}: {e} (known rules: {}, {}, {})",
                     KernelIdiomRule::WarnOn,
-                    KernelIdiomRule::FlsFamily
+                    KernelIdiomRule::FlsFamily,
+                    KernelIdiomRule::SwapMemSwap
                 )
             })
         })

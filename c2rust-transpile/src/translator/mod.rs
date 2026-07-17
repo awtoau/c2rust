@@ -3917,6 +3917,220 @@ impl<'c> Translation<'c> {
             })
     }
 
+    /// If `body_stmt_id` is exactly the body of the kernel's `swap(a, b)` macro
+    /// (see `minmax.h`'s `#define swap(a, b) do { typeof(a) __tmp = (a); (a) =
+    /// (b); (b) = __tmp; } while (0)`), return the `CExprId`s of its `a` and `b`
+    /// operands.
+    ///
+    /// Unlike `WARN_ON`, `swap`'s expansion is a plain statement macro (a
+    /// `do{}while(0)` loop, not a GNU statement expression), and Clang's AST
+    /// exporter only records macro-expansion provenance for `Expr` nodes (see
+    /// `encode_entry`'s two overloads in `AstExporter.cpp`: the `Expr*` overload
+    /// passes `encodeMacroExpansions = true`, the `Stmt*` overload hardcodes
+    /// `false`). A `DoStmt` is a `Stmt`, not an `Expr`, so no macro decl is ever
+    /// attached to it or its `CompoundStmt` body — the macro-origin approach
+    /// that makes `warn_on_condition` safe has nothing to match against here.
+    /// This falls back to structural matching of the expanded shape instead,
+    /// the same fallback the WARN_ON investigation considered before finding
+    /// the macro-origin path worked for that case.
+    ///
+    /// Because this matches shape rather than macro origin, hand-written code
+    /// that happens to build the identical three-statement temp-variable dance
+    /// would also match and be rewritten. That's accepted here: the shape is
+    /// specific enough (a single-declaration temp initialized from `a`, then
+    /// `a = b`, then `b = temp`, with the temp used nowhere else) that this
+    /// rewrite is semantically equivalent to whatever loop it replaces
+    /// regardless of whether a macro produced it.
+    pub(crate) fn swap_operands(&self, body_stmt_id: CStmtId) -> Option<(CExprId, CExprId)> {
+        if !self
+            .tcfg
+            .kernel_idiom_rules
+            .is_enabled(crate::KernelIdiomRule::SwapMemSwap)
+        {
+            return None;
+        }
+
+        // Expected shape: { typeof(a) __tmp = (a); (a) = (b); (b) = __tmp; }
+        let CStmtKind::Compound(ref substmt_ids) = self.ast_context[body_stmt_id].kind else {
+            return None;
+        };
+        let [decl_stmt_id, first_assign_id, second_assign_id] = substmt_ids[..] else {
+            return None;
+        };
+
+        let CStmtKind::Decls(ref decl_ids) = self.ast_context[decl_stmt_id].kind else {
+            return None;
+        };
+        let [tmp_decl_id] = decl_ids[..] else {
+            return None;
+        };
+        let CDeclKind::Variable {
+            initializer: Some(tmp_init_id),
+            ..
+        } = self.ast_context[tmp_decl_id].kind
+        else {
+            return None;
+        };
+        // `typeof(a) __tmp = (a);`'s initializer is an lvalue-to-rvalue
+        // `ImplicitCast` wrapping the parenthesized `DeclRef`/`Member`, since a
+        // variable initializer is read, not written — `unwrap_cast_expr` peels
+        // both the cast and the parens to reach the underlying place expression.
+        let a_id = self.ast_context.unwrap_cast_expr(tmp_init_id);
+
+        let CStmtKind::Expr(first_assign_expr_id) = self.ast_context[first_assign_id].kind else {
+            return None;
+        };
+        let CExprKind::Binary(_, CBinOp::Assign, assign_a_id, b_rvalue_id, None, None) =
+            self.ast_context.index_unwrap_parens(first_assign_expr_id).kind
+        else {
+            return None;
+        };
+        // Same lvalue-to-rvalue cast as above applies to `(b)` on the RHS of
+        // `(a) = (b)`.
+        let b_id = self.ast_context.unwrap_cast_expr(b_rvalue_id);
+
+        let CStmtKind::Expr(second_assign_expr_id) = self.ast_context[second_assign_id].kind
+        else {
+            return None;
+        };
+        let CExprKind::Binary(_, CBinOp::Assign, assign_b_id, tmp_read_id, None, None) =
+            self.ast_context.index_unwrap_parens(second_assign_expr_id).kind
+        else {
+            return None;
+        };
+
+        // Confirm `(a) = (b)` writes to the same lvalue `a` was read from, and
+        // `(b) = __tmp` writes to the same lvalue `b` was read from and reads
+        // back the exact temp declared above — i.e. this isn't some unrelated
+        // three-statement sequence that happens to match the outer shape.
+        let CExprKind::DeclRef(_, tmp_read_decl_id, _) =
+            self.ast_context[self.ast_context.unwrap_cast_expr(tmp_read_id)].kind
+        else {
+            return None;
+        };
+        if tmp_read_decl_id != tmp_decl_id {
+            return None;
+        }
+        if !self.exprs_are_same_lvalue(assign_a_id, a_id)
+            || !self.exprs_are_same_lvalue(assign_b_id, b_id)
+        {
+            return None;
+        }
+
+        // Both operands must be side-effect-free (no post-increment, no call,
+        // no assignment) since the rewrite evaluates each of `a`/`b` once as a
+        // place expression, not once per appearance the way the expanded C
+        // macro's three statements do; a side-effecting operand's evaluation
+        // count would visibly change under `core::mem::swap`.
+        if !self.ast_context.is_expr_pure(a_id) || !self.ast_context.is_expr_pure(b_id) {
+            return None;
+        }
+
+        // A bitfield member has no address in Rust (it's backed by generated
+        // accessor/setter methods, not a directly addressable field), so
+        // `&mut` can't be formed for it; a volatile lvalue must go through
+        // `volatile_read`/`volatile_write` rather than a plain reference, so a
+        // bare `&mut` would silently drop the volatile access discipline.
+        // Either case falls through to the literal transliteration, which
+        // reads/writes each operand the normal way and stays correct.
+        if self.expr_is_bitfield_or_volatile(a_id) || self.expr_is_bitfield_or_volatile(b_id) {
+            return None;
+        }
+
+        Some((a_id, b_id))
+    }
+
+    /// Best-effort check that `lhs` and `rhs` refer to the same C lvalue
+    /// (ignoring parens and casts), used to confirm `swap_operands`'s three
+    /// statements are actually operating on the same two variables rather
+    /// than merely having the right statement shapes. Trivially handles the
+    /// two forms `swap`'s operands take in the kernel corpus — a plain
+    /// variable (`DeclRef`) or a struct/union member access (`Member`,
+    /// covering both `.` and `->`, and nested member chains via the
+    /// recursive call on the base) — and is intentionally conservative:
+    /// anything else (array subscripts, pointer dereferences) returns
+    /// `false` rather than risk a false-positive match, leaving that shape
+    /// to fall through to the literal translation.
+    ///
+    /// Casts must be unwrapped, not just parens: a `->`/`.` access's base
+    /// (e.g. `pcs` in `pcs->main`) is recorded by Clang as an
+    /// `ImplicitCastExpr(LValueToRValue)` wrapping the `DeclRefExpr`, since
+    /// reading a struct pointer to then access through it is itself an
+    /// lvalue-to-rvalue conversion. Comparing without stripping that cast
+    /// would never find two `Member` bases equal, even for the trivial
+    /// `pcs->main` / `pcs->main` case appearing on both sides of one swap.
+    fn exprs_are_same_lvalue(&self, lhs: CExprId, rhs: CExprId) -> bool {
+        let lhs = self.ast_context[self.ast_context.unwrap_cast_expr(lhs)]
+            .kind
+            .clone();
+        let rhs = self.ast_context[self.ast_context.unwrap_cast_expr(rhs)]
+            .kind
+            .clone();
+        match (lhs, rhs) {
+            (CExprKind::DeclRef(_, l, _), CExprKind::DeclRef(_, r, _)) => l == r,
+            (
+                CExprKind::Member(_, l_base, l_field, _, _),
+                CExprKind::Member(_, r_base, r_field, _, _),
+            ) => l_field == r_field && self.exprs_are_same_lvalue(l_base, r_base),
+            _ => false,
+        }
+    }
+
+    /// True if `expr_id` is a bitfield member access, or has a volatile-qualified
+    /// type — the two lvalue shapes `swap_operands` must not rewrite into a bare
+    /// `&mut`. Mirrors the bitfield check `convert_bitfield_assignment_op_with_rhs`'s
+    /// caller uses (matching on `CExprKind::Member`'s field decl for a
+    /// `bitfield_width: Some(_)`) and the volatile check `name_reference`'s
+    /// `read` helper uses (`qualifiers.is_volatile` on the expression's own
+    /// type), since those are the two places this codebase already treats
+    /// these lvalue kinds as needing special handling instead of a plain
+    /// reference.
+    fn expr_is_bitfield_or_volatile(&self, expr_id: CExprId) -> bool {
+        let expr_id = self.ast_context.unwrap_parens(expr_id);
+        if let CExprKind::Member(_, _, field_decl_id, _, _) =
+            self.ast_context.index_unwrap_parens(expr_id).kind
+        {
+            if let CDeclKind::Field {
+                bitfield_width: Some(_),
+                ..
+            } = self.ast_context[field_decl_id].kind
+            {
+                return true;
+            }
+        }
+        self.ast_context[expr_id]
+            .kind
+            .get_qual_type()
+            .is_some_and(|qty| qty.qualifiers.is_volatile)
+    }
+
+    /// Emit `core::mem::swap(&mut a, &mut b)` in place of the literal
+    /// three-statement temp-variable dance `swap(a, b)`'s macro expansion
+    /// transliterates to. `core::mem::swap` is referenced by its fully
+    /// qualified path rather than imported, since it is only ever used as a
+    /// call and never needs a bare `swap` identifier in scope (which could
+    /// collide with a local function or variable of that name).
+    pub(crate) fn convert_swap(
+        &self,
+        ctx: ExprContext,
+        a_id: CExprId,
+        b_id: CExprId,
+    ) -> TranslationResult<Vec<Stmt>> {
+        let a = self.convert_expr(ctx.used(), a_id, None)?;
+        let b = self.convert_expr(ctx.used(), b_id, None)?;
+        let (mut stmts, (a_expr, b_expr)) = a.zip(b).discard_unsafe();
+
+        let call = mk().call_expr(
+            mk().abs_path_expr(vec!["core", "mem", "swap"]),
+            vec![
+                mk().mutbl().borrow_expr(a_expr),
+                mk().mutbl().borrow_expr(b_expr),
+            ],
+        );
+        stmts.push(mk().semi_stmt(call));
+        Ok(stmts)
+    }
+
     pub fn convert_cast(
         &self,
         mut ctx: ExprContext,
