@@ -557,22 +557,17 @@ impl<'c> Translation<'c> {
                 .expect("target type must be a pointer");
             let mutability = pointee_type_id.mutability();
 
-            let fn_name = match self.tcfg.edition {
-                RustEdition::Edition2021 => {
-                    // Rust 1.76: feature name changed to `exposed_provenance[_mut]`
-                    // Rust 1.84: stabilized
-                    self.use_feature("strict_provenance");
-
-                    // Rust 1.79: method name changed to `with_exposed_provenance[_mut]`
-                    match mutability {
-                        Mutability::Immutable => "from_exposed_addr",
-                        Mutability::Mutable => "from_exposed_addr_mut",
-                    }
-                }
-                RustEdition::Edition2024 => match mutability {
-                    Mutability::Immutable => "with_exposed_provenance",
-                    Mutability::Mutable => "with_exposed_provenance_mut",
-                },
+            // `with_exposed_provenance[_mut]` (stabilized Rust 1.84) works
+            // under any edition — this used to key off `self.tcfg.edition`
+            // and emit the pre-1.79 name `from_exposed_addr[_mut]` for
+            // Edition2021, but that's a toolchain-version fact, not an
+            // edition fact: `from_exposed_addr` doesn't exist on any
+            // current compiler regardless of requested output edition, so
+            // the old branch always produced code that fails to compile.
+            self.use_feature("strict_provenance");
+            let fn_name = match mutability {
+                Mutability::Immutable => "with_exposed_provenance",
+                Mutability::Mutable => "with_exposed_provenance_mut",
             };
             let pointee_type_rs = self.convert_pointee_type(pointee_type_id.ctype)?;
             let type_args = mk().angle_bracketed_args(vec![pointee_type_rs]);
@@ -611,18 +606,11 @@ impl<'c> Translation<'c> {
                 WithStmts::new_val(transmute_expr(source_ty, target_type_rs, val)).set_unsafe()
             }))
         } else {
-            // First convert the pointer to `usize`.
-            let method_name = match self.tcfg.edition {
-                RustEdition::Edition2021 => {
-                    // Rust 1.76: feature name changed to `exposed_provenance`
-                    // Rust 1.84: stabilized
-                    self.use_feature("strict_provenance");
-
-                    // Rust 1.79: method name changed to `expose_provenance`
-                    "expose_addr"
-                }
-                RustEdition::Edition2024 => "expose_provenance",
-            };
+            // First convert the pointer to `usize`. Same toolchain-vs-
+            // edition fix as with_exposed_provenance above: expose_addr
+            // doesn't exist on any current compiler regardless of edition.
+            self.use_feature("strict_provenance");
+            let method_name = "expose_provenance";
 
             let val = val.map(|val| mk().method_call_expr(val, method_name, vec![]));
 

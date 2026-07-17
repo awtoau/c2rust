@@ -22,15 +22,13 @@ macro_rules! match_or {
     };
 }
 
-pub fn mk_va_list_ty(edition: RustEdition, lifetime: Option<&str>) -> Box<Type> {
-    // This was updated in <https://github.com/rust-lang/rust/pull/141980>,
-    // first changed in `nightly-2025-12-07`.
-    // `VaListImpl` was removed.
-    let name = if edition < Edition2024 {
-        "VaListImpl"
-    } else {
-        "VaList"
-    };
+pub fn mk_va_list_ty(_edition: RustEdition, lifetime: Option<&str>) -> Box<Type> {
+    // `VaListImpl` was removed from core::ffi on nightlies from
+    // 2025-12-07 onward (rust-lang/rust#141980) — a toolchain-version
+    // fact, not an edition fact. `VaList` (its replacement) works under
+    // any edition, so always emit it; keeping `edition` as a parameter
+    // (now unused) avoids touching its call sites' signatures.
+    let name = "VaList";
     let lifetime_args = match lifetime {
         None => vec![],
         Some(lifetime) => vec![mk().lifetime(lifetime)],

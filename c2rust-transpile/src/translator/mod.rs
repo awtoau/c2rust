@@ -3136,31 +3136,25 @@ impl<'c> Translation<'c> {
         let tys = vec![ty];
         let mut path = vec![mk().path_segment("core")];
         // `core::intrinsics::pref_align_of` was removed in Rust 1.89
-        // (https://github.com/rust-lang/rust/pull/141803).
-        // There is no longer a notion of preferred alignment in Rust,
-        // so in edition 2024, we no longer support
-        // the non-standard `__alignof`/`__alignof__` extensions.
-        // Normal alignment should always be a valid preferred alignment,
-        // even if in a few cases, it is smaller,
-        // so rather than having a hard error here,
-        // we polyfill it with normal alignment.
-        if preferred && self.tcfg.edition < Edition2024 {
-            self.use_feature("core_intrinsics");
-            path.push(mk().path_segment("intrinsics"));
-            path.push(mk().path_segment_with_args("pref_align_of", mk().angle_bracketed_args(tys)));
-        } else {
-            if preferred {
-                let msg = "using `core::mem::align_of` instead of `core::intrinsics::pref_align_of` \
-                    for preferred alignment (`__alignof`/`__alignof__`) as the latter has been removed in Rust";
-                if let Some(loc) = self.ast_context.display_loc(src_loc) {
-                    warn!("{loc}: {msg}");
-                } else {
-                    warn!("{msg}");
-                }
+        // (https://github.com/rust-lang/rust/pull/141803) — a toolchain-
+        // version fact, not an edition fact; it doesn't exist on any
+        // current compiler regardless of requested output edition, so
+        // this used to unconditionally emit code that fails to compile
+        // whenever `preferred` was true under Edition2021. Always use the
+        // `core::mem::align_of` polyfill instead: normal alignment should
+        // always be a valid preferred alignment, even if in a few cases
+        // it is smaller, so this is safe rather than a hard error.
+        if preferred {
+            let msg = "using `core::mem::align_of` instead of `core::intrinsics::pref_align_of` \
+                for preferred alignment (`__alignof`/`__alignof__`) as the latter has been removed in Rust";
+            if let Some(loc) = self.ast_context.display_loc(src_loc) {
+                warn!("{loc}: {msg}");
+            } else {
+                warn!("{msg}");
             }
-            path.push(mk().path_segment("mem"));
-            path.push(mk().path_segment_with_args("align_of", mk().angle_bracketed_args(tys)));
         }
+        path.push(mk().path_segment("mem"));
+        path.push(mk().path_segment_with_args("align_of", mk().angle_bracketed_args(tys)));
         let call = mk().call_expr(mk().abs_path_expr(path), vec![]);
         self.make_cast(
             ctx,
