@@ -1786,11 +1786,30 @@ impl CfgBuilder {
             }
 
             CStmtKind::Attributed { substatement, .. } => {
-                // Note: we only support the fallthrough attribute for which no action is
-                // required.
+                // Attributes (e.g. `fallthrough`, or a `_Pragma("clang loop
+                // unroll(...)")` attached to a loop by macros like the kernel's
+                // `unrolled_full`) are compiler hints with no effect on program
+                // semantics, so it's always safe to drop them and just translate
+                // the wrapped substatement as if the attribute weren't there.
+                //
+                // The substatement is not necessarily empty: e.g. a loop-unroll
+                // pragma attaches to the `for`/`while` statement it precedes,
+                // giving a real, non-trivial substatement here.
                 match translator.ast_context.index(substatement).kind {
                     CStmtKind::Empty => Ok(Some(wip)),
-                    _ => panic!("Expected empty attributed statement"),
+                    _ => {
+                        let sub_entry = self.fresh_label();
+                        self.add_wip_block(wip, Jump(sub_entry.clone()));
+                        let sub_stmt_next = self.convert_stmt_help(
+                            translator,
+                            ctx,
+                            substatement,
+                            in_tail.clone(),
+                            sub_entry,
+                            ret_ty,
+                        )?;
+                        Ok(sub_stmt_next.map(|l| self.new_wip_block(l)))
+                    }
                 }
             }
 
