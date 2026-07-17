@@ -6,13 +6,16 @@ impl<'c> Translation<'c> {
     pub fn convert_binary_expr(
         &self,
         mut ctx: ExprContext,
-        expr_type_id: CQualTypeId,
+        expected_type_id: Option<CQualTypeId>,
+        result_type_id: CQualTypeId,
         op: CBinOp,
         lhs: CExprId,
         rhs: CExprId,
-        opt_lhs_type_id: Option<CQualTypeId>,
-        opt_res_type_id: Option<CQualTypeId>,
+        compute_lhs_type_id: Option<CQualTypeId>,
+        compute_res_type_id: Option<CQualTypeId>,
     ) -> TranslationResult<WithStmts<Box<Expr>>> {
+        let expr_type_id = expected_type_id.unwrap_or(result_type_id);
+
         // If we're not making an assignment, a binop will require parens
         // applied to ternary conditionals
         if !op.is_assignment() {
@@ -49,12 +52,13 @@ impl<'c> Translation<'c> {
             // No sequence-point cases
             op if op.is_assignment() => self.convert_assignment_operator(
                 ctx,
+                expected_type_id,
+                result_type_id,
                 op,
-                expr_type_id,
                 lhs,
                 rhs,
-                opt_lhs_type_id,
-                opt_res_type_id,
+                compute_lhs_type_id,
+                compute_res_type_id,
             ),
 
             _ => {
@@ -194,10 +198,9 @@ impl<'c> Translation<'c> {
         read: Box<Expr>,
         write: Box<Expr>,
         rhs: Box<Expr>,
-        initial_lhs_type_id: CQualTypeId,
+        lhs_type_id: CQualTypeId,
         compute_lhs_type_id: CQualTypeId,
         compute_res_type_id: CQualTypeId,
-        lhs_type_id: CQualTypeId,
         rhs_type_id: CQualTypeId,
     ) -> TranslationResult<WithStmts<Box<Expr>>> {
         if self.ast_context.resolve_type_id(compute_lhs_type_id.ctype)
@@ -211,7 +214,7 @@ impl<'c> Translation<'c> {
         } else {
             let lhs = self.make_cast(
                 ctx.used(),
-                initial_lhs_type_id,
+                lhs_type_id,
                 compute_lhs_type_id,
                 WithStmts::new_val(read.clone()),
             )?;
@@ -236,14 +239,15 @@ impl<'c> Translation<'c> {
 
     /// Translate an assignment binary operator.
     ///
-    /// `compute_lhs_ty` and `compute_res_ty` correspond to Clang's
+    /// `compute_lhs_type_id` and `compute_res_type_id` correspond to Clang's
     /// `CompoundAssignOperator::{CompLHSType,CompResultType}`; see the Clang docs:
     /// https://clang.llvm.org/doxygen/classclang_1_1CompoundAssignOperator.html#details
     fn convert_assignment_operator(
         &self,
         ctx: ExprContext,
+        expected_type_id: Option<CQualTypeId>,
+        result_type_id: CQualTypeId,
         op: CBinOp,
-        expr_type_id: CQualTypeId,
         lhs: CExprId,
         rhs: CExprId,
         compute_lhs_type_id: Option<CQualTypeId>,
@@ -299,8 +303,9 @@ impl<'c> Translation<'c> {
         // Now that we've translated the rhs, finish translating the assignment operator.
         self.convert_assignment_operator_with_rhs(
             ctx,
+            expected_type_id,
+            result_type_id,
             op,
-            expr_type_id,
             lhs,
             rhs_type_id,
             rhs_translation,
@@ -313,8 +318,9 @@ impl<'c> Translation<'c> {
     fn convert_assignment_operator_with_rhs(
         &self,
         ctx: ExprContext,
+        expected_type_id: Option<CQualTypeId>,
+        result_type_id: CQualTypeId,
         op: CBinOp,
-        expr_type_id: CQualTypeId,
         lhs: CExprId,
         rhs_type_id: CQualTypeId,
         rhs_translation: WithStmts<Box<Expr>>,
@@ -329,18 +335,14 @@ impl<'c> Translation<'c> {
             assert!(compute_res_type_id.is_some());
         }
 
-        let ty = self.convert_type(expr_type_id.ctype)?;
-
-        let result_type_id = compute_res_type_id.unwrap_or(expr_type_id);
-        let expr_or_comp_type_id = compute_lhs_type_id.unwrap_or(expr_type_id);
-        let initial_lhs = &self.ast_context.index_unwrap_parens(lhs).kind;
-        let initial_lhs_type_id = initial_lhs
+        let lhs_kind = &self.ast_context.index_unwrap_parens(lhs).kind;
+        let lhs_type_id = lhs_kind
             .get_qual_type()
             .ok_or_else(|| format_err!("bad initial lhs type"))?;
 
-        let bitfield_id = match initial_lhs {
+        let bitfield_id = match *lhs_kind {
             CExprKind::Member(_, _, decl_id, _, _) => {
-                let kind = &self.ast_context[*decl_id].kind;
+                let kind = &self.ast_context[decl_id].kind;
 
                 if let CDeclKind::Field {
                     bitfield_width: Some(_),
@@ -356,17 +358,23 @@ impl<'c> Translation<'c> {
         };
 
         if let Some(field_id) = bitfield_id {
+            let ty = self.convert_type(lhs_type_id.ctype)?;
             let rhs_expr = mk().cast_expr(rhs_translation.to_expr(), ty);
-            return self.convert_bitfield_assignment_op_with_rhs(ctx, op, lhs, rhs_expr, *field_id);
+            return self.convert_bitfield_assignment_op_with_rhs(ctx, op, lhs, rhs_expr, field_id);
         }
 
-        let is_volatile = initial_lhs_type_id.qualifiers.is_volatile;
+        let is_volatile = lhs_type_id.qualifiers.is_volatile;
         let is_volatile_compound_assign = op.underlying_assignment().is_some() && is_volatile;
 
-        let expr_resolved_ty = self.ast_context.resolve_type(expr_type_id.ctype);
-        let compute_resolved_ty = &self.ast_context.resolve_type(expr_or_comp_type_id.ctype);
+        let lhs_type_kind = &self.ast_context.resolve_type(lhs_type_id.ctype).kind;
+        let compute_res_type_id = compute_res_type_id.unwrap_or(lhs_type_id);
+        let compute_lhs_type_id = compute_lhs_type_id.unwrap_or(lhs_type_id);
+        let compute_lhs_type_kind = &self
+            .ast_context
+            .resolve_type(compute_lhs_type_id.ctype)
+            .kind;
 
-        let pointer_lhs = match &expr_resolved_ty.kind {
+        let pointer_lhs = match lhs_type_kind {
             &CTypeKind::Pointer(pointee) => Some(pointee),
             _ => None,
         };
@@ -374,9 +382,9 @@ impl<'c> Translation<'c> {
         let is_unsigned_arith = op
             .underlying_assignment()
             .map_or(false, |op| op.is_arithmetic())
-            && compute_resolved_ty.kind.is_unsigned_integral_type();
+            && compute_lhs_type_kind.is_unsigned_integral_type();
 
-        let lhs_translation = if initial_lhs_type_id.ctype != expr_or_comp_type_id.ctype
+        let lhs_translation = if lhs_type_id.ctype != compute_lhs_type_id.ctype
             || ctx.is_used()
             || pointer_lhs.is_some()
             || is_volatile_compound_assign
@@ -390,109 +398,106 @@ impl<'c> Translation<'c> {
             })
         };
 
-        rhs_translation.zip(lhs_translation).and_then_try(|(rhs, lhs)| {
-            let NamedReference {
-                lvalue: write,
-                rvalue: read,
-            } = lhs;
+        rhs_translation
+            .zip(lhs_translation)
+            .and_then_try(|(rhs, lhs)| {
+                let NamedReference {
+                    lvalue: write,
+                    rvalue: read,
+                } = lhs;
 
-            // Assignment expression itself
-            use CBinOp::*;
-            let assign_stmt = match op {
-                // Regular (possibly volatile) assignment
-                Assign if !is_volatile => WithStmts::new_val(mk().assign_expr(write, rhs)),
-                Assign => WithStmts::new_val(self.volatile_write(
-                    write,
-                    initial_lhs_type_id,
-                    rhs,
-                )?).set_unsafe(),
+                // Assignment expression itself
+                use CBinOp::*;
+                let assign_stmt = match op {
+                    // Regular (possibly volatile) assignment
+                    Assign if !is_volatile => WithStmts::new_val(mk().assign_expr(write, rhs)),
+                    Assign => WithStmts::new_val(self.volatile_write(write, lhs_type_id, rhs)?)
+                        .set_unsafe(),
 
-                // Anything volatile needs to be desugared into explicit reads and writes
-                op if is_volatile || is_unsigned_arith => {
-                    // Cast the lhs to the compute lhs type, do the compute, and then
-                    // cast the compute result to the final lhs type.
+                    // Anything volatile needs to be desugared into explicit reads and writes
+                    op if is_volatile || is_unsigned_arith => {
+                        // Cast the lhs to the compute lhs type, do the compute, and then
+                        // cast the compute result to the final lhs type.
 
-                    let op = op
-                        .underlying_assignment()
-                        .expect("Cannot convert non-assignment operator");
+                        let op = op
+                            .underlying_assignment()
+                            .expect("Cannot convert non-assignment operator");
 
-                    let lhs = self.make_cast(
-                        ctx.used(),
-                        initial_lhs_type_id,
-                        expr_or_comp_type_id,
-                        WithStmts::new_val(read.clone()),
-                    )?;
+                        let lhs = self.make_cast(
+                            ctx.used(),
+                            lhs_type_id,
+                            compute_res_type_id,
+                            WithStmts::new_val(read.clone()),
+                        )?;
 
-                    let val = lhs.and_then_try(|lhs|
-                        self.convert_binary_operator(
-                            ctx,
-                            result_type_id,
-                            op,
-                            expr_or_comp_type_id,
-                            rhs_type_id,
-                            lhs,
+                        let val = lhs.and_then_try(|lhs| {
+                            self.convert_binary_operator(
+                                ctx,
+                                compute_res_type_id,
+                                op,
+                                compute_lhs_type_id,
+                                rhs_type_id,
+                                lhs,
+                                rhs,
+                            )
+                        })?;
+
+                        let val = self.make_cast(ctx, compute_res_type_id, lhs_type_id, val)?;
+
+                        if is_volatile {
+                            val.try_map(|val| self.volatile_write(write, lhs_type_id, val))?
+                                .set_unsafe()
+                        } else {
+                            val.map(|val| mk().assign_expr(write, val))
+                        }
+                    }
+
+                    // Everything else
+                    AssignAdd | AssignSubtract if pointer_lhs.is_some() => {
+                        let ptr = self.convert_pointer_offset(
+                            write.clone(),
                             rhs,
-                        )
-                    )?;
+                            pointer_lhs.unwrap().ctype,
+                            op == AssignSubtract,
+                            false,
+                        );
+                        ptr.map(|ptr| mk().assign_expr(write, ptr))
+                    }
 
-                    let val = self.make_cast(
-                        ctx.used(),
-                        result_type_id,
-                        expr_type_id,
-                        val,
-                    )?;
+                    _ => {
+                        let bin_op = op
+                            .underlying_assignment()
+                            .expect("Cannot convert non-assignment operator");
+                        let bin_op_kind = BinOp::from(op);
 
-                    #[allow(clippy::let_and_return /* , reason = "block is large, so variable name helps" */)]
-                    let write = if is_volatile {
-                        val.and_then_try(|val| {
-                            TranslationResult::Ok(WithStmts::new_val(
-                                self.volatile_write(write, initial_lhs_type_id, val)?,
-                            ).set_unsafe())
-                        })?
-                    } else {
-                        val.map(|val| mk().assign_expr(write, val))
-                    };
-                    write
-                }
+                        self.convert_assignment_operator_aux(
+                            ctx,
+                            bin_op_kind,
+                            bin_op,
+                            read.clone(),
+                            write,
+                            rhs,
+                            lhs_type_id,
+                            compute_lhs_type_id,
+                            compute_res_type_id,
+                            rhs_type_id,
+                        )?
+                    }
+                };
 
-                // Everything else
-                AssignAdd | AssignSubtract if pointer_lhs.is_some() => {
-                    let ptr = self.convert_pointer_offset(
-                        write.clone(),
-                        rhs,
-                        pointer_lhs.unwrap().ctype,
-                        op == AssignSubtract,
-                        false,
-                    );
-                    ptr.map(|ptr| mk().assign_expr(write, ptr))
-                }
+                let assign_result = self.make_cast(
+                    ctx,
+                    result_type_id,
+                    expected_type_id.unwrap_or(result_type_id),
+                    WithStmts::new_val(read),
+                )?;
 
-                _ => {
-                    let bin_op = op
-                        .underlying_assignment()
-                        .expect("Cannot convert non-assignment operator");
-                    let bin_op_kind = BinOp::from(op);
-
-                    self.convert_assignment_operator_aux(
-                        ctx,
-                        bin_op_kind,
-                        bin_op,
-                        read.clone(),
-                        write,
-                        rhs,
-                        initial_lhs_type_id,
-                        compute_lhs_type_id.unwrap(),
-                        compute_res_type_id.unwrap(),
-                        expr_type_id,
-                        rhs_type_id,
-                    )?
-                }
-            };
-
-            Ok(assign_stmt.and_then(|assign_stmt| {
-                WithStmts::new(vec![mk().semi_stmt(assign_stmt)], read)
-            }))
-        })
+                Ok(assign_stmt
+                    .zip(assign_result)
+                    .and_then(|(assign_stmt, assign_result)| {
+                        WithStmts::new(vec![mk().semi_stmt(assign_stmt)], assign_result)
+                    }))
+            })
     }
 
     /// Translate a non-assignment binary operator. It is expected that the `lhs` and `rhs`
@@ -598,7 +603,8 @@ impl<'c> Translation<'c> {
     fn convert_pre_increment(
         &self,
         ctx: ExprContext,
-        ty: CQualTypeId,
+        expected_type_id: Option<CQualTypeId>,
+        result_type_id: CQualTypeId,
         op: CBinOp,
         arg: CExprId,
     ) -> TranslationResult<WithStmts<Box<Expr>>> {
@@ -609,7 +615,7 @@ impl<'c> Translation<'c> {
             .get_qual_type()
             .ok_or_else(|| format_err!("bad arg type"))?;
 
-        let one = match self.ast_context.resolve_type(ty.ctype).kind {
+        let one = match self.ast_context.resolve_type(arg_type.ctype).kind {
             // TODO: If rust gets f16 support:
             // CTypeKind::Half |
             CTypeKind::Float | CTypeKind::Double => mk().lit_expr(mk().float_unsuffixed_lit("1.")),
@@ -633,26 +639,28 @@ impl<'c> Translation<'c> {
 
         self.convert_assignment_operator_with_rhs(
             ctx,
+            expected_type_id,
+            result_type_id,
             op,
-            ty,
             arg,
             one_type_id,
             WithStmts::new_val(one),
             Some(arg_type),
-            Some(ty),
+            Some(result_type_id),
         )
     }
 
     fn convert_post_increment(
         &self,
         ctx: ExprContext,
-        ty: CQualTypeId,
+        expected_type_id: Option<CQualTypeId>,
+        result_type_id: CQualTypeId,
         op: CBinOp,
         arg: CExprId,
     ) -> TranslationResult<WithStmts<Box<Expr>>> {
         // If we aren't going to be using the result, may as well do a simple pre-increment
         if ctx.is_unused() {
-            return self.convert_pre_increment(ctx, ty, op, arg);
+            return self.convert_pre_increment(ctx, expected_type_id, result_type_id, op, arg);
         }
 
         let op = op
@@ -744,30 +752,48 @@ impl<'c> Translation<'c> {
     pub fn convert_unary_operator(
         &self,
         ctx: ExprContext,
-        name: CUnOp,
-        cqual_type: CQualTypeId,
+        expected_type_id: Option<CQualTypeId>,
+        result_type_id: CQualTypeId,
+        op: CUnOp,
         arg: CExprId,
     ) -> TranslationResult<WithStmts<Box<Expr>>> {
-        let mut unary = match name {
-            CUnOp::AddressOf => self.convert_address_of(ctx, cqual_type, arg),
-            CUnOp::PreIncrement => {
-                self.convert_pre_increment(ctx, cqual_type, CBinOp::AssignAdd, arg)
-            }
-            CUnOp::PreDecrement => {
-                self.convert_pre_increment(ctx, cqual_type, CBinOp::AssignSubtract, arg)
-            }
-            CUnOp::PostIncrement => {
-                self.convert_post_increment(ctx, cqual_type, CBinOp::AssignAdd, arg)
-            }
-            CUnOp::PostDecrement => {
-                self.convert_post_increment(ctx, cqual_type, CBinOp::AssignSubtract, arg)
-            }
-            CUnOp::Deref => self.convert_deref(ctx, cqual_type, arg),
-            CUnOp::Plus => self.convert_expr(ctx.used(), arg, Some(cqual_type)), // promotion is explicit in the clang AST
+        let expr_type_id = expected_type_id.unwrap_or(result_type_id);
+        let mut unary = match op {
+            CUnOp::AddressOf => self.convert_address_of(ctx, expr_type_id, arg),
+            CUnOp::PreIncrement => self.convert_pre_increment(
+                ctx,
+                expected_type_id,
+                result_type_id,
+                CBinOp::AssignAdd,
+                arg,
+            ),
+            CUnOp::PreDecrement => self.convert_pre_increment(
+                ctx,
+                expected_type_id,
+                result_type_id,
+                CBinOp::AssignSubtract,
+                arg,
+            ),
+            CUnOp::PostIncrement => self.convert_post_increment(
+                ctx,
+                expected_type_id,
+                result_type_id,
+                CBinOp::AssignAdd,
+                arg,
+            ),
+            CUnOp::PostDecrement => self.convert_post_increment(
+                ctx,
+                expected_type_id,
+                result_type_id,
+                CBinOp::AssignSubtract,
+                arg,
+            ),
+            CUnOp::Deref => self.convert_deref(ctx, expr_type_id, arg),
+            CUnOp::Plus => self.convert_expr(ctx.used(), arg, expected_type_id), // promotion is explicit in the clang AST
 
-            CUnOp::Negate => self.convert_negate_operator(ctx, cqual_type, arg),
+            CUnOp::Negate => self.convert_negate_operator(ctx, expr_type_id, arg),
             CUnOp::Complement => Ok(self
-                .convert_expr(ctx.used(), arg, Some(cqual_type))?
+                .convert_expr(ctx.used(), arg, expected_type_id)?
                 .map(|a| mk().unary_expr(UnOp::Not(Default::default()), a))),
 
             CUnOp::Not => {
@@ -775,7 +801,7 @@ impl<'c> Translation<'c> {
                 Ok(val.map(|x| mk().cast_expr(x, mk().abs_path_ty(vec!["core", "ffi", "c_int"]))))
             }
             CUnOp::Extension => {
-                let arg = self.convert_expr(ctx, arg, Some(cqual_type))?;
+                let arg = self.convert_expr(ctx, arg, expected_type_id)?;
                 Ok(arg)
             }
             CUnOp::Real | CUnOp::Imag | CUnOp::Coawait => {
@@ -789,7 +815,7 @@ impl<'c> Translation<'c> {
         // `UnOp::Extension` (`__extension__`) is another exception since
         // it's a no-op around the inner expression.
         if !matches!(
-            name,
+            op,
             CUnOp::PreDecrement
                 | CUnOp::PreIncrement
                 | CUnOp::PostDecrement
