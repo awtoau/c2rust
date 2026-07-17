@@ -422,6 +422,28 @@ impl ConversionContext {
             self.add_expr(new_expr_id, located(node, expr));
             self.processed_nodes.insert(new_expr_id, node_types::EXPR);
 
+            // `node`'s macro-expansion provenance (from the Clang AST export) is
+            // captured against `new_id` for expressions converted in `EXPR` context,
+            // but here the expression is being wrapped in a statement, so it lives
+            // under the freshly synthesized `new_expr_id` instead. Without this, a
+            // bare-statement invocation of a statement-expression macro (e.g.
+            // `WARN_ON(x);`) loses its macro-origin information entirely, even
+            // though Clang reported it, because nothing else ever queries
+            // `new_id`'s macro data as a `CExprId`.
+            for mac_id in &node.macro_expansions {
+                let mac = CDeclId(self.visit_node_type(*mac_id, node_types::MACRO_DECL));
+                self.typed_context
+                    .macro_invocations
+                    .entry(CExprId(new_expr_id))
+                    .or_default()
+                    .push(mac);
+            }
+            if let Some(text) = &node.macro_expansion_text {
+                self.typed_context
+                    .macro_expansion_text
+                    .insert(CExprId(new_expr_id), text.clone());
+            }
+
             // We wrap the expression in a STMT
             let semi_stmt = CStmtKind::Expr(CExprId(new_expr_id));
             self.add_stmt(new_id, located(node, semi_stmt));
@@ -1062,6 +1084,11 @@ impl ConversionContext {
                         .insert(CExprId(new_id), text.clone());
                 }
             }
+            // Note: when `expected_ty & STMT != 0` (a macro-expanded expression used
+            // as a bare statement, e.g. `WARN_ON(x);`), Clang still reports the same
+            // macro-expansion provenance on `node`, but `expr_possibly_as_stmt` below
+            // synthesizes a separate `CExprId` for the wrapped expression, so that
+            // case records `node`'s macro data itself once that id exists.
 
             match node.tag {
                 // Statements

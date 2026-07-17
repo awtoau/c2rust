@@ -3630,7 +3630,7 @@ impl<'c> Translation<'c> {
             Predefined(_, val_id) => self.convert_expr(ctx, val_id, override_ty),
 
             Statements(_, compound_stmt_id) => {
-                self.convert_statement_expression(ctx, compound_stmt_id)
+                self.convert_statement_expression(ctx, expr_id, compound_stmt_id)
             }
 
             VAArg(ty, val_id) => self.convert_vaarg(ctx, ty, val_id),
@@ -3706,8 +3706,13 @@ impl<'c> Translation<'c> {
     fn convert_statement_expression(
         &self,
         ctx: ExprContext,
+        expr_id: CExprId,
         compound_stmt_id: CStmtId,
     ) -> TranslationResult<WithStmts<Box<Expr>>> {
+        if let Some(condition_id) = self.warn_on_condition(expr_id, compound_stmt_id) {
+            return self.convert_warn_on(ctx, condition_id);
+        }
+
         fn as_semi_break_stmt(stmt: &Stmt, lbl: &cfg::Label) -> Option<Option<Box<Expr>>> {
             if let Stmt::Expr(
                 Expr::Break(ExprBreak {
@@ -3797,6 +3802,111 @@ impl<'c> Translation<'c> {
                 }
             }
         }
+    }
+
+    /// If `expr_id`/`compound_stmt_id` is exactly one expansion of the kernel's
+    /// `WARN_ON` macro, return the `CExprId` of its `condition` argument.
+    ///
+    /// `WARN_ON_ONCE` is deliberately excluded (it expands to a
+    /// structurally-identical statement expression via a different macro decl
+    /// name) because linux-rs's `kernel` crate doesn't yet expose once-semantics;
+    /// rewriting it here would silently drop the "only warn once" behavior.
+    ///
+    /// The macro-origin check (matching the exact macro decl recorded by the
+    /// Clang AST export, rather than only the shape of the expanded statements)
+    /// is what makes this safe: hand-written code that happens to build the same
+    /// `let __ret = !!(cond); if unlikely(__ret) { ... } unlikely(__ret)` shape,
+    /// or an unrelated macro that happens to be named `WARN_ON`, would not match
+    /// unless Clang itself attributes the expansion to `WARN_ON`'s macro decl.
+    /// The structural walk after that check exists only to locate `condition`
+    /// within the confirmed expansion, not to detect the expansion itself.
+    fn warn_on_condition(
+        &self,
+        expr_id: CExprId,
+        compound_stmt_id: CStmtId,
+    ) -> Option<CExprId> {
+        let macro_ids = self.ast_context.macro_invocations.get(&expr_id)?;
+        let is_warn_on = macro_ids.iter().any(|macro_id| {
+            matches!(
+                &self.ast_context[*macro_id].kind,
+                CDeclKind::MacroFunction { name, params }
+                    if name == "WARN_ON" && params.len() == 1
+            )
+        });
+        if !is_warn_on {
+            return None;
+        }
+
+        // Expected shape (see asm-generic/bug.h's `WARN_ON`):
+        //   { let __ret_warn_on = !!(condition); if (unlikely(__ret_warn_on)) { ... } unlikely(__ret_warn_on) }
+        // Only the first statement is needed; `condition` is the same subexpression
+        // in both the `let` initializer and the final `unlikely(...)` result, so we
+        // don't need to look past it.
+        let CStmtKind::Compound(ref substmt_ids) = self.ast_context[compound_stmt_id].kind else {
+            return None;
+        };
+        let first_id = *substmt_ids.first()?;
+        let CStmtKind::Decls(ref decl_ids) = self.ast_context[first_id].kind else {
+            return None;
+        };
+        let [decl_id] = decl_ids[..] else {
+            return None;
+        };
+        let CDeclKind::Variable {
+            initializer: Some(init_id),
+            ..
+        } = self.ast_context[decl_id].kind
+        else {
+            return None;
+        };
+
+        // Peel `!!(condition)`, i.e. two nested logical-not unary operators.
+        let CExprKind::Unary(_, CUnOp::Not, inner_id, _) =
+            self.ast_context.index_unwrap_parens(init_id).kind
+        else {
+            return None;
+        };
+        let CExprKind::Unary(_, CUnOp::Not, condition_id, _) =
+            self.ast_context.index_unwrap_parens(inner_id).kind
+        else {
+            return None;
+        };
+
+        Some(self.ast_context.unwrap_parens(condition_id))
+    }
+
+    /// Emit `kernel::warn_on!(condition)`, importing `kernel::warn_on` once per
+    /// output file. This mirrors `rust/kernel/bug.rs`'s `warn_on!`, which reports
+    /// the warning and returns `condition`'s truth value, matching the C macro's
+    /// `unlikely(__ret_warn_on)` result — so it is a drop-in replacement whether
+    /// `WARN_ON(...)` is used as a bare statement or as a value (e.g. `if
+    /// WARN_ON(...)`).
+    fn convert_warn_on(
+        &self,
+        ctx: ExprContext,
+        condition_id: CExprId,
+    ) -> TranslationResult<WithStmts<Box<Expr>>> {
+        self.items
+            .borrow_mut()
+            .entry(self.cur_file())
+            .or_default()
+            .add_use(true, vec!["kernel".into()], "warn_on");
+
+        self.convert_expr(ctx.used(), condition_id, None)?
+            .and_then_try(|condition| {
+                use syn::__private::ToTokens;
+                let tokens = condition.to_token_stream();
+                let mac = mk().mac_expr(mk().mac(
+                    mk().path(vec!["kernel", "warn_on"]),
+                    tokens,
+                    MacroDelimiter::Paren(Default::default()),
+                ));
+                self.convert_side_effects_expr(
+                    ctx,
+                    WithStmts::new_val(mac),
+                    "warn_on! is not supposed to be used",
+                )
+            })
     }
 
     pub fn convert_cast(
