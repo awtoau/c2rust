@@ -51,13 +51,79 @@ a deviation with no rule behind it, is not landable just because the
 tests didn't catch it — the same rule-conformance review a hand
 translation gets applies here too.
 
-Patches in this fork are written to be general fixes (not narrow
+Stage-1 reliability patches are written to be general fixes (not narrow
 kernel-only special-cases) wherever the underlying gap is a real one in
 `c2rust`'s C-construct coverage — things like GCC extended-asm label
 operands (`asm goto`), architecture-conditional builtin vector types,
 and `_Pragma`-based loop-unroll attributes, all real gaps against
 kernel source that upstream's existing test corpus doesn't happen to
-exercise — and are intended to be upstreamable.
+exercise, and are upstreamable in principle. This fork does not
+currently open PRs against `immunant/c2rust` — fixes stay here.
+
+### Stage-3 kernel-idiom rewrites: opt-in, not upstreamable
+
+Once a construct transpiles reliably (stage 1), later work can target
+*emitting linux-rs's required idiom directly* instead of a literal
+transliteration — e.g. `WARN_ON(cond)` as `kernel::warn_on!(cond)`
+instead of the expanded `let __ret = !!(cond); if unlikely(...) {...}`
+scaffolding, or the kernel's generic `fls`/`__fls`/`__ffs`/`fls64`
+bit-scan functions as `leading_zeros()`/`trailing_zeros()` arithmetic
+instead of a transliterated byte-scan loop. Unlike stage-1 fixes,
+**these are linux-rs-specific idiom choices, not general C-to-Rust
+correctness fixes** — plain `c2rust transpile` with no extra flags
+must stay byte-for-byte identical to stock upstream behavior for
+anyone else using this fork as an ordinary transpiler.
+
+Each rewrite is registered in `c2rust-transpile::kernel_idioms`
+(`KernelIdiomRule`) and only fires when explicitly requested via
+`--enable-rule=<rule>[,<rule>...]` (or `--enable-rule=all` for every
+rule this build knows about) on the `c2rust transpile` CLI. linux-rs's
+own `scripts/run_c2rust_baseline.py` passes `--enable-rule=all`
+unconditionally, so its baseline/regression runs always exercise every
+landed rule without needing an update each time a new one is added —
+adding rule N+1 means adding it to the registry and (if warranted)
+`rulesdb/rules/*.toml` on the linux-rs side; the Python harness doesn't
+change.
+
+The pattern for adding a new one, established across three rules this
+far (`warn-on`, `fls-family`, `swap-mem-swap`):
+
+1. Rank remaining rule-conformance violations by count
+   (`scripts/check_c2rust_rule_conformance.py` on linux-rs, or query
+   `patterns.db`'s `c2rust_rule_conformance` table directly — `rule_id`
+   is stored without the `rulesdb/rules/NNNN-`-style numeric prefix,
+   e.g. `"fls-family"` not `"0006-fls-family"`) — fix the biggest gap
+   first.
+2. Find the real C definition of whatever's being mistranslated and
+   work out the exact Rust replacement BEFORE writing any translator
+   code — for anything involving arithmetic (not a pure 1:1 syntactic
+   substitution like a macro call), verify numerically against real
+   compiled C behavior across edge cases, not just one happy-path
+   value. A translation that compiles and looks plausible but is
+   silently wrong by a constant offset is strictly worse than the
+   literal transliteration it would replace (see `rulesdb/rules/`'s own
+   `[validation] negative` warnings — several rules document exactly
+   this failure mode from a prior attempt).
+3. Detect via the most precise signal available: macro-expansion
+   origin (Clang reports which macro a given AST subtree expanded
+   from) where the construct is a macro, exact function name + parameter/
+   return C-type-kind match where it's a real header-inline function —
+   never bare AST-shape pattern-matching alone if a more precise origin
+   signal exists, since shape-only matching risks misfiring on
+   unrelated hand-written code that happens to look similar.
+4. Add the new arm to `KernelIdiomRule` and gate the rewrite behind it;
+   confirm the DEFAULT (no `--enable-rule` flags) path is provably
+   unchanged before anything else.
+5. Verify: full-corpus baseline before/after
+   (`dev.py c2rust-baseline` on linux-rs) must show identical outcome
+   counts (clean/dropped_decls/crash) — a rule rewrite changes *what*
+   gets emitted for already-successful declarations, never whether a
+   file succeeds or fails to transpile at all; `dev.py c2rust-regress
+   <before-rev> <after-rev>` for a hard per-declaration regression
+   gate; re-run the conformance checker and confirm the violation count
+   for that rule drops to (ideally) zero, with any nonzero remainder
+   explained (an excluded edge case, a name collision with an unrelated
+   user function, etc.) rather than silently accepted.
 
 <!-- ANCHOR: intro -->
 
