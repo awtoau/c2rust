@@ -31,11 +31,11 @@ pub enum KernelIdiomRule {
     /// Enable every rule below, present and future.
     All,
 
-    /// Recognize expansions of the kernel's `WARN_ON` macro (matched by
-    /// macro decl, not by the shape of the expanded statement-expression)
-    /// and emit `kernel::warn_on!(condition)` instead of transliterating
-    /// the `let __ret = !!(cond); if unlikely(__ret) {...} unlikely(__ret)`
-    /// scaffolding the macro expands to.
+    /// Recognize expansions of the kernel's `WARN_ON` and `WARN` macros
+    /// (matched by macro decl, not by the shape of the expanded
+    /// statement-expression) and emit `kernel::warn_on!(condition)` instead
+    /// of transliterating the `let __ret = !!(cond); if unlikely(__ret)
+    /// {...} unlikely(__ret)` scaffolding either macro expands to.
     WarnOn,
 
     /// Recognize the kernel's generic bit-scan primitives —

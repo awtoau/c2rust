@@ -3805,21 +3805,39 @@ impl<'c> Translation<'c> {
     }
 
     /// If `expr_id`/`compound_stmt_id` is exactly one expansion of the kernel's
-    /// `WARN_ON` macro, return the `CExprId` of its `condition` argument.
+    /// `WARN_ON` or `WARN` macro, return the `CExprId` of its `condition`
+    /// argument.
     ///
-    /// `WARN_ON_ONCE` is deliberately excluded (it expands to a
-    /// structurally-identical statement expression via a different macro decl
-    /// name) because linux-rs's `kernel` crate doesn't yet expose once-semantics;
-    /// rewriting it here would silently drop the "only warn once" behavior.
+    /// `WARN(condition, format...)` expands through the identical `let
+    /// __ret_warn_on = !!(condition); if (unlikely(__ret_warn_on))
+    /// __WARN_printf(...); unlikely(__ret_warn_on);` scaffolding as `WARN_ON`
+    /// (see asm-generic/bug.h) — it just also takes a printf-style diagnostic
+    /// message that `WARN_ON` hardcodes from the stringified condition instead.
+    /// `kernel::warn_on!` doesn't carry a custom message either way (it reports
+    /// a fixed taint/flags warning off of `cond`'s truth value alone), so the
+    /// rewrite is a faithful drop-in for both macros — the diagnostic text is
+    /// lost the same way `WARN_ON`'s condition-string diagnostic already is.
+    /// `WARN` is variadic (`condition` plus a `format...` placeholder), so
+    /// unlike `WARN_ON`'s fixed one-parameter shape its recorded macro decl can
+    /// have more than one entry in `params`; matching accepts either name and
+    /// only requires at least one parameter (the leading `condition`), never
+    /// zero, since a macro decl with no parameters can't be either of these.
+    ///
+    /// `WARN_ON_ONCE`/`WARN_ONCE`/`WARN_TAINT`/`WARN_TAINT_ONCE` are
+    /// deliberately excluded (each expands to a structurally-identical
+    /// statement expression via a distinct macro decl name) because
+    /// linux-rs's `kernel` crate doesn't yet expose once-semantics or custom
+    /// taint values; rewriting them here would silently drop that behavior.
     ///
     /// The macro-origin check (matching the exact macro decl recorded by the
     /// Clang AST export, rather than only the shape of the expanded statements)
     /// is what makes this safe: hand-written code that happens to build the same
     /// `let __ret = !!(cond); if unlikely(__ret) { ... } unlikely(__ret)` shape,
-    /// or an unrelated macro that happens to be named `WARN_ON`, would not match
-    /// unless Clang itself attributes the expansion to `WARN_ON`'s macro decl.
-    /// The structural walk after that check exists only to locate `condition`
-    /// within the confirmed expansion, not to detect the expansion itself.
+    /// or an unrelated macro that happens to be named `WARN_ON`/`WARN`, would
+    /// not match unless Clang itself attributes the expansion to one of those
+    /// macro decls. The structural walk after that check exists only to locate
+    /// `condition` within the confirmed expansion, not to detect the expansion
+    /// itself.
     fn warn_on_condition(
         &self,
         expr_id: CExprId,
@@ -3838,7 +3856,11 @@ impl<'c> Translation<'c> {
             matches!(
                 &self.ast_context[*macro_id].kind,
                 CDeclKind::MacroFunction { name, params }
-                    if name == "WARN_ON" && params.len() == 1
+                    if !params.is_empty()
+                        && (
+                            (name == "WARN_ON" && params.len() == 1)
+                                || (name == "WARN" && params.len() >= 1)
+                        )
             )
         });
         if !is_warn_on {
