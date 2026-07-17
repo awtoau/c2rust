@@ -3457,14 +3457,21 @@ impl<'c> Translation<'c> {
 
                     // Struct Type
                     let decl_id = {
-                        let kind = match self.ast_context[qty.ctype].kind {
-                            CTypeKind::Elaborated(ty_id) => &self.ast_context[ty_id].kind,
-                            ref kind => kind,
-                        };
+                        // Only unwrapping Elaborated missed GNU typeof(...)-
+                        // derived struct arguments (CTypeKind::TypeOf), which
+                        // resolve fine once fully unwrapped — confirmed via
+                        // instrumented reproduction on fs/fcntl.c and
+                        // fs/readdir.c, both offsetof(typeof(...), field)
+                        // call sites whose underlying type is a real,
+                        // resolvable Struct decl. resolve_type_no_typedef
+                        // already generalizes this (stops at Typedef so the
+                        // as_decl_or_typedef Typedef branch below still
+                        // fires for offsetof(some_typedef_t, field)).
+                        let resolved = self.ast_context.resolve_type_no_typedef(qty.ctype);
 
-                        eprintln!("DEBUG offsetof qty.ctype={:?} kind={:?}", qty.ctype, kind);
-
-                        kind.as_decl_or_typedef()
+                        resolved
+                            .kind
+                            .as_decl_or_typedef()
                             .expect("Did not find decl_id for offsetof struct")
                     };
                     let name = self.resolve_decl_inner_name(decl_id);
