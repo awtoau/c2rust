@@ -664,6 +664,19 @@ impl TypedAstContext {
         }
     }
 
+    /// Like `array_len`, but `None` instead of panicking for anything other
+    /// than a `ConstantArray` (e.g. `IncompleteArray`, real for a `__weak`
+    /// declaration with no initializer such as `const char linux_banner[]
+    /// __weak;` — the type genuinely doesn't carry a length). Callers that
+    /// already have another way to know the real length (e.g. a string
+    /// literal's own byte content) should prefer that over panicking.
+    pub fn array_len_opt(&self, typ: CTypeId) -> Option<usize> {
+        match self.resolve_type(typ).kind {
+            CTypeKind::ConstantArray(_, len) => Some(len),
+            _ => None,
+        }
+    }
+
     /// Can the given field decl be a flexible array member?
     pub fn maybe_flexible_array(&self, typ: CTypeId) -> bool {
         let field_ty = self.resolve_type(typ);

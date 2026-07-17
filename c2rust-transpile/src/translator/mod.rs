@@ -2685,7 +2685,19 @@ impl<'c> Translation<'c> {
                             .expect("cleanup function not registered with renamer");
                         let cleanup_ident = mk().ident(&cleanup_name);
                         let var_ident = mk().ident(&rust_name);
-                        let guard_ident = mk().ident(&format!("_cleanup_{}", rust_name));
+                        // rust_name may already carry the `r#` raw-identifier
+                        // marker (e.g. a C parameter literally named `in`) —
+                        // concatenating a prefix onto that produces a string
+                        // like "_cleanup_r#in", which is neither a valid
+                        // plain nor raw identifier and panics inside quote's
+                        // runtime. Strip it first; the derived guard-
+                        // variable name doesn't need to preserve raw-ness
+                        // itself, matching the same strip_prefix("r#")
+                        // pattern already used for synthetic names derived
+                        // from possibly-raw field names in structs_unions.rs.
+                        let plain_rust_name = rust_name.strip_prefix("r#").unwrap_or(&rust_name);
+                        let guard_ident =
+                            mk().ident(&format!("_cleanup_{}", plain_rust_name));
                         syn::parse_quote! {
                             let #guard_ident = CleanupGuard(
                                 &raw mut #var_ident as *mut _,
@@ -3449,6 +3461,8 @@ impl<'c> Translation<'c> {
                             CTypeKind::Elaborated(ty_id) => &self.ast_context[ty_id].kind,
                             ref kind => kind,
                         };
+
+                        eprintln!("DEBUG offsetof qty.ctype={:?} kind={:?}", qty.ctype, kind);
 
                         kind.as_decl_or_typedef()
                             .expect("Did not find decl_id for offsetof struct")

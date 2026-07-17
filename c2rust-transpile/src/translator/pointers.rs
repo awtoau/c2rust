@@ -122,14 +122,21 @@ impl<'c> Translation<'c> {
         // Narrow string literals are translated directly as `[u8; N]` literals when their address
         // is taken, without the transmute. String/byte literals are already references in Rust.
         if let (
-            Some(&CExprKind::Literal(literal_cty, CLiteral::String(_, element_size @ 1))),
+            Some(&CExprKind::Literal(literal_cty, CLiteral::String(ref bytes, element_size @ 1))),
             false,
         ) = (arg_expr_kind, arg_is_macro)
         {
             if is_array_decay {
                 val = val.map(|val| mk().method_call_expr(val, "as_ptr", vec![]));
             } else {
-                let size = self.ast_context.array_len(literal_cty.ctype) * element_size as usize;
+                // See string_literal_bytes' doc comment: the declared array
+                // type may not carry a length (e.g. an IncompleteArray on a
+                // `__weak` decl) even though the literal's own bytes do.
+                let size = self
+                    .ast_context
+                    .array_len_opt(literal_cty.ctype)
+                    .map(|len| len * element_size as usize)
+                    .unwrap_or(bytes.len());
                 ref_cast_pointee_ty =
                     Some(mk().array_ty(mk().ident_ty("u8"), mk().lit_expr(size as u128)));
             }

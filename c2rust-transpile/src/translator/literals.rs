@@ -154,7 +154,18 @@ impl<'c> Translation<'c> {
     /// Returns the bytes of a string literal, including any additional zero bytes to pad the
     /// literal to the expected size.
     pub fn string_literal_bytes(&self, ctype: CTypeId, bytes: &[u8], element_size: u8) -> Vec<u8> {
-        let size = self.ast_context.array_len(ctype) * element_size as usize;
+        // A string-literal expression always carries its own real byte
+        // content (`bytes`) regardless of the surrounding declaration's
+        // array type — a declared type without a fixed length (e.g. a
+        // `__weak` decl like `const char linux_banner[] __weak;`, which
+        // exists for other TUs to define, not this one) has no length to
+        // look up, but that's not a reason to fail: fall back to the
+        // literal's own length instead of requiring the type to supply one.
+        let size = self
+            .ast_context
+            .array_len_opt(ctype)
+            .map(|len| len * element_size as usize)
+            .unwrap_or(bytes.len());
         let mut bytes_padded = Vec::with_capacity(size);
         bytes_padded.extend(bytes);
         bytes_padded.resize(size, 0);
