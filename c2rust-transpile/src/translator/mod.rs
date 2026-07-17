@@ -19,7 +19,7 @@ use serde_derive::Serialize;
 use syn::spanned::Spanned as _;
 use syn::{
     AttrStyle, BareVariadic, BinOp, Block, Expr, ExprBinary, ExprBlock, ExprBreak, ExprCast,
-    ExprParen, ExprReturn, ExprUnary, FnArg, ForeignItem, ForeignItemFn, ForeignItemMacro,
+    ExprLit, ExprParen, ExprReturn, ExprUnary, FnArg, ForeignItem, ForeignItemFn, ForeignItemMacro,
     ForeignItemStatic, ForeignItemType, Ident, Item, ItemConst, ItemEnum, ItemExternCrate, ItemFn,
     ItemForeignMod, ItemImpl, ItemMacro, ItemMod, ItemStatic, ItemStruct, ItemTrait,
     ItemTraitAlias, ItemType, ItemUnion, ItemUse, Lit, MacroDelimiter, PathSegment, ReturnType,
