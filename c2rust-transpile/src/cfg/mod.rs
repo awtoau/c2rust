@@ -674,13 +674,19 @@ impl<Lbl: Clone + Ord + Hash + Debug, Stmt> Cfg<Lbl, Stmt> {
                     continue;
                 }
 
-                let blk = self.nodes.get(&lbl).unwrap_or_else(|| {
-                    panic!(
-                        "prune_unreachable_blocks: block not found\n{:?}\n{:?}",
-                        lbl,
-                        self.nodes.keys().cloned().collect::<Vec<Lbl>>()
-                    )
-                });
+                // A terminator's jump target isn't guaranteed to correspond
+                // to a live basic block in `self.nodes` — the same dangling-
+                // label shape prune_empty_blocks_mut above works around (a
+                // label that's only ever a jump *target*, e.g. a GNU
+                // statement-expression's exit label bound directly to a
+                // trailing result rather than a distinct block; observed via
+                // the kernel's wait_event_* macro family). Treat it as
+                // simply not reachable through this path rather than a hard
+                // error — the label was never going to be visited anyway
+                // once its own (nonexistent) block failed to resolve.
+                let Some(blk) = self.nodes.get(&lbl) else {
+                    continue;
+                };
                 visited.insert(lbl);
 
                 for lbl in blk.terminator.get_labels() {
@@ -740,8 +746,26 @@ impl<Lbl: Clone + Ord + Hash + Debug, Stmt> Cfg<Lbl, Stmt> {
             // It makes no sense to remap something to itself
             for from in from_any {
                 if from != to_final {
-                    let span = self.nodes[&from].span;
-                    let tgt_span = &mut self.nodes[&to_final].span;
+                    // `from` is always a real node (proposed_rewrites is seeded
+                    // only from self.nodes' own keys), but `to_final` is
+                    // whatever a chain of jump targets resolves to, which can
+                    // be a label that was only ever a jump *target* — never
+                    // itself the label of a live basic block in `self.nodes`
+                    // (observed via GNU statement-expressions with a `goto`
+                    // that jumps directly to a label bound to the expression's
+                    // trailing result, e.g. the kernel's `wait_event_*` macro
+                    // family's `__out:` exit label). Indexing both sides
+                    // unconditionally panicked here; skip the merge instead —
+                    // it's an empty-block-merging optimization, not required
+                    // for correctness, so leaving this one block unmerged is
+                    // strictly safer than aborting the whole translation.
+                    let Some(&span) = self.nodes.get(&from).map(|bb| &bb.span) else {
+                        continue;
+                    };
+                    let Some(tgt_span) = self.nodes.get_mut(&to_final).map(|bb| &mut bb.span)
+                    else {
+                        continue;
+                    };
                     if tgt_span.is_dummy() {
                         *tgt_span = span;
                     } else if !span.is_dummy() {
