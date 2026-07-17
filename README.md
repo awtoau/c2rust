@@ -33,16 +33,23 @@ its output moves from "unsafe, unidiomatic, but functionally faithful"
 (c2rust's own stated design goal, see below) toward what linux-rs's
 rules require.
 
-Regardless of how good the output gets, **landing still goes through
-linux-rs's full verification pipeline** — build, a differential oracle
-against the original C, a QEMU boot, and the kernel's KUnit test
-suites — the same bar every translation in linux-rs is held to,
-whether hand-written or c2rust-derived. That bar exists because
-"compiles and passes tests" has already been shown, empirically, in
-this project, to be insufficient on its own to catch semantic drift
-(a translation can compile clean and still be wrong in ways tests don't
-happen to exercise); the pipeline, not the origin of the draft, is what
-decides what lands.
+Regardless of how good the output gets, **landing requires two things,
+both of them, for every translation whether hand-written or
+c2rust-derived**: (1) linux-rs's full verification pipeline passing —
+build, a differential oracle against the original C, a QEMU boot, and
+the kernel's KUnit test suites — and (2) the translation actually
+conforming to linux-rs's rules (`rulesdb/rules/*.toml`): every
+deviation from literal C semantics traceable to either something Rust's
+type system forces or a specific cited rule. Pipeline-green alone is
+**not** sufficient and is not treated as sufficient — this project has
+already seen, empirically, drafts that compiled clean, booted, and
+passed KUnit while being semantically wrong in ways the tests didn't
+happen to exercise (a silently swapped allocator was one concrete
+case). A c2rust-derived translation that passes the pipeline but, say,
+reimplements a function the target arch actually overrides, or invents
+a deviation with no rule behind it, is not landable just because the
+tests didn't catch it — the same rule-conformance review a hand
+translation gets applies here too.
 
 Patches in this fork are written to be general fixes (not narrow
 kernel-only special-cases) wherever the underlying gap is a real one in
