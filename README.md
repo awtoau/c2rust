@@ -104,17 +104,34 @@ far (`warn-on`, `fls-family`, `swap-mem-swap`):
    literal transliteration it would replace (see `rulesdb/rules/`'s own
    `[validation] negative` warnings — several rules document exactly
    this failure mode from a prior attempt).
-3. Detect via the most precise signal available: macro-expansion
+3. **The Rust replacement must call into linux-riscv's real, vendored
+   Rust-for-Linux `kernel` crate (`linux-riscv/rust/kernel/*.rs`) —
+   never reimplement kernel behavior independently inside the
+   translated file.** `WARN_ON` targets `kernel::warn_on!` (`rust/
+   kernel/bug.rs`), itself backed by a `rust/helpers/bug.c` C shim
+   (`rust_helper_WARN_ON`) that bindgen exposes as `bindings::WARN_ON`
+   — a thin bridge to the real C macro, not a Rust reimplementation of
+   its behavior. If the target rule needs a kernel-crate API that
+   doesn't exist yet in `rust/kernel/`, porting/wrapping that API
+   (verified against the real C it wraps, with a `rust/helpers/*.c`
+   shim if the C side is a macro/inline function bindgen can't see
+   directly) is a REQUIRED prerequisite step, done and verified before
+   any c2rust rewrite targets it — not a shortcut to skip by having
+   the rewrite emit ad hoc equivalent logic instead of the real API
+   call. (Rust standard-library targets — `leading_zeros()`,
+   `core::mem::swap` — don't need this: they're not kernel-crate APIs,
+   just the correct idiomatic Rust for the C construct.)
+4. Detect via the most precise signal available: macro-expansion
    origin (Clang reports which macro a given AST subtree expanded
    from) where the construct is a macro, exact function name + parameter/
    return C-type-kind match where it's a real header-inline function —
    never bare AST-shape pattern-matching alone if a more precise origin
    signal exists, since shape-only matching risks misfiring on
    unrelated hand-written code that happens to look similar.
-4. Add the new arm to `KernelIdiomRule` and gate the rewrite behind it;
+5. Add the new arm to `KernelIdiomRule` and gate the rewrite behind it;
    confirm the DEFAULT (no `--enable-rule` flags) path is provably
    unchanged before anything else.
-5. Verify: full-corpus baseline before/after
+6. Verify: full-corpus baseline before/after
    (`dev.py c2rust-baseline` on linux-rs) must show identical outcome
    counts (clean/dropped_decls/crash) — a rule rewrite changes *what*
    gets emitted for already-successful declarations, never whether a
