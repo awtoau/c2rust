@@ -4984,11 +4984,22 @@ impl<'c> Translation<'c> {
                     decl_id = *self.ast_context.prenamed_decls.get(&decl_id).unwrap();
                 }
 
-                let ident_name = self
-                    .type_converter
-                    .borrow()
-                    .resolve_decl_name(decl_id)
-                    .expect("Expected decl name");
+                // Top-level struct/union/enum/typedef names are pre-populated
+                // into the renamer before any decl conversion runs, but a
+                // NESTED anonymous struct/union (e.g. inside `struct page`)
+                // is only named lazily, the first time `type_converter`'s
+                // own `convert()` reaches it — which can be AFTER this
+                // function runs, if a `sizeof(...)` on that type is baked
+                // into an earlier top-level const-macro reconstruction.
+                // Omitting the `use` import for a decl whose name isn't
+                // resolved yet doesn't affect correctness (imports are a
+                // convenience, not required — the decl gets referenced by
+                // its fully-qualified/later-assigned name at first proper
+                // use), so skip rather than panic.
+                let Some(ident_name) = self.type_converter.borrow().resolve_decl_name(decl_id)
+                else {
+                    return imports;
+                };
                 imports.insert(Import {
                     decl_id,
                     ident_name,

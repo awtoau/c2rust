@@ -1265,12 +1265,28 @@ impl TypedAstContext {
                             to_walk.push(decl_id);
                         }
 
-                        if let CDeclKind::EnumConstant { .. } = self.c_decls[&decl_id].kind {
+                        // `decl_id` reached this point via DFNodes' traversal
+                        // of already-encoded AST, so it's normally a real
+                        // entry in `self.c_decls` — but a dangling reference
+                        // to a node the AST exporter never encoded (the same
+                        // shape as the &&label / dropped-node class of bug)
+                        // can still surface here. `wanted.insert` above
+                        // already recorded it as wanted regardless of
+                        // whether its kind can be inspected; the two
+                        // special-cases below just can't fire for a decl we
+                        // have no data for, so skip them instead of
+                        // panicking.
+                        let Some(decl) = self.c_decls.get(&decl_id) else {
+                            continue;
+                        };
+
+                        if let CDeclKind::EnumConstant { .. } = decl.kind {
                             // Special case for enums.  The enum constant is used, so the whole
                             // enum is also used.
-                            let parent_id = self.parents[&decl_id];
-                            if wanted.insert(parent_id) {
-                                to_walk.push(parent_id);
+                            if let Some(&parent_id) = self.parents.get(&decl_id) {
+                                if wanted.insert(parent_id) {
+                                    to_walk.push(parent_id);
+                                }
                             }
                         }
 
@@ -1278,7 +1294,7 @@ impl TypedAstContext {
                         // function through the attribute payload, not via a
                         // DeclRef the traversal would otherwise see, so mark it
                         // here.
-                        if let CDeclKind::Variable { ref attrs, .. } = self.c_decls[&decl_id].kind {
+                        if let CDeclKind::Variable { ref attrs, .. } = decl.kind {
                             for attr in attrs {
                                 if let Attribute::Cleanup(fn_id) = attr {
                                     if wanted.insert(*fn_id) {
