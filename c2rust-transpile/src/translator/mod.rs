@@ -4043,14 +4043,16 @@ impl<'c> Translation<'c> {
     /// Best-effort check that `lhs` and `rhs` refer to the same C lvalue
     /// (ignoring parens and casts), used to confirm `swap_operands`'s three
     /// statements are actually operating on the same two variables rather
-    /// than merely having the right statement shapes. Trivially handles the
-    /// two forms `swap`'s operands take in the kernel corpus — a plain
-    /// variable (`DeclRef`) or a struct/union member access (`Member`,
-    /// covering both `.` and `->`, and nested member chains via the
-    /// recursive call on the base) — and is intentionally conservative:
-    /// anything else (array subscripts, pointer dereferences) returns
-    /// `false` rather than risk a false-positive match, leaving that shape
-    /// to fall through to the literal translation.
+    /// than merely having the right statement shapes. Handles the forms
+    /// `swap`'s operands take in the kernel corpus — a plain variable
+    /// (`DeclRef`), a struct/union member access (`Member`, covering both
+    /// `.` and `->`, and nested member chains via the recursive call on the
+    /// base), and a pointer dereference (`Unary(Deref, ...)`, e.g. `*x`) —
+    /// and is intentionally conservative beyond that: an array subscript
+    /// returns `false` rather than risk a false-positive match (the index
+    /// expression would need its own purity/equality checks this rewrite
+    /// doesn't do), leaving that shape to fall through to the literal
+    /// translation.
     ///
     /// Casts must be unwrapped, not just parens: a `->`/`.` access's base
     /// (e.g. `pcs` in `pcs->main`) is recorded by Clang as an
@@ -4059,6 +4061,7 @@ impl<'c> Translation<'c> {
     /// lvalue-to-rvalue conversion. Comparing without stripping that cast
     /// would never find two `Member` bases equal, even for the trivial
     /// `pcs->main` / `pcs->main` case appearing on both sides of one swap.
+    /// The same applies to a deref's pointer operand (`x` in `*x`).
     fn exprs_are_same_lvalue(&self, lhs: CExprId, rhs: CExprId) -> bool {
         let lhs = self.ast_context[self.ast_context.unwrap_cast_expr(lhs)]
             .kind
@@ -4072,6 +4075,10 @@ impl<'c> Translation<'c> {
                 CExprKind::Member(_, l_base, l_field, _, _),
                 CExprKind::Member(_, r_base, r_field, _, _),
             ) => l_field == r_field && self.exprs_are_same_lvalue(l_base, r_base),
+            (
+                CExprKind::Unary(_, CUnOp::Deref, l_ptr, _),
+                CExprKind::Unary(_, CUnOp::Deref, r_ptr, _),
+            ) => self.exprs_are_same_lvalue(l_ptr, r_ptr),
             _ => false,
         }
     }
