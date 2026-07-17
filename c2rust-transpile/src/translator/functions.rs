@@ -206,13 +206,20 @@ impl<'c> Translation<'c> {
                     body_stmts.append(&mut self.compute_variable_array_sizes(ctx, typ.ctype)?);
                 }
 
-                let body_ids = match self.ast_context.index(body).kind {
-                    CStmtKind::Compound(ref stmts) => stmts,
-                    _ => panic!("function body expects to be a compound statement"),
+                let mut converted_body = if let Some(bit_scan_body) =
+                    self.bit_scan_idiom_body(name, arguments, return_type)
+                {
+                    bit_scan_body
+                } else {
+                    let body_ids = match self.ast_context.index(body).kind {
+                        CStmtKind::Compound(ref stmts) => stmts,
+                        _ => panic!("function body expects to be a compound statement"),
+                    };
+                    let mut converted_body =
+                        self.convert_block_with_scope(ctx, name, body_ids, return_type, ret)?;
+                    strip_tail_return(&mut converted_body);
+                    converted_body
                 };
-                let mut converted_body =
-                    self.convert_block_with_scope(ctx, name, body_ids, return_type, ret)?;
-                strip_tail_return(&mut converted_body);
 
                 // If `alloca` was used in the function body, include a variable to hold the
                 // allocations.
@@ -333,6 +340,127 @@ impl<'c> Translation<'c> {
                 Ok(ConvertedDecl::ForeignItem(function_decl))
             }
         })
+    }
+
+    /// If `name`/`arguments`/`return_type` exactly matches one of the kernel's
+    /// generic bit-scan primitives (`asm-generic/bitops/{fls,__fls,__ffs,fls64}.h`),
+    /// return a one-statement body built from `u32`/`u64::leading_zeros()` or
+    /// `trailing_zeros()` in place of the C header's byte-at-a-time scan loop.
+    ///
+    /// The name match alone is not enough to fire this — a user's own function
+    /// that happens to be called `fls64` with an unrelated signature (different
+    /// parameter count, wrong integer width, wrong return type) falls through
+    /// to the normal per-statement translation below. Matching both name and
+    /// the exact parameter/return C type kinds is what makes this specific to
+    /// the kernel primitives rather than any identifier that happens to collide.
+    ///
+    /// Each formula is checked against the width of the *actual* parameter
+    /// type rather than a fixed width, since `unsigned long`/`unsigned long
+    /// long` are both in play here (`__fls`/`__ffs` take `unsigned long`,
+    /// which is 64 bits on this target; `fls64` takes `__u64`, i.e. `unsigned
+    /// long long`, also 64 bits; plain `fls` takes `unsigned int`, 32 bits).
+    /// Getting the width wrong silently shifts the result by a constant, so
+    /// the check on parameter type kind is load-bearing, not decorative.
+    fn bit_scan_idiom_body(
+        &self,
+        name: &str,
+        arguments: &[(CDeclId, String, CQualTypeId)],
+        return_type: Option<CQualTypeId>,
+    ) -> Option<Vec<Stmt>> {
+        if !self
+            .tcfg
+            .kernel_idiom_rules
+            .is_enabled(crate::KernelIdiomRule::FlsFamily)
+        {
+            return None;
+        }
+
+        #[derive(Clone, Copy)]
+        enum Kind {
+            // fls(x): 1-based MSB index, defined at 0 -> 0.
+            // Loop invariant in generic_fls is `r = 32 - leading_zeros(x)`,
+            // with the `x == 0` special case coinciding with that formula
+            // already (0u32.leading_zeros() == 32, so 32 - 32 == 0).
+            Fls,
+            // __fls(word): 0-based MSB index, UB at word == 0 in C. The loop
+            // starts `num` at `BITS - 1` and only ever subtracts, so
+            // `num = (BITS - 1) - leading_zeros(word)`.
+            UnderscoreFls,
+            // __ffs(word): 0-based LSB index, UB at word == 0 in C. The loop
+            // counts exactly the trailing zero bits before the first set bit.
+            UnderscoreFfs,
+            // fls64(x): defined at 0 -> 0. `__fls(x) + 1` for x != 0 folds
+            // into the same shape as Fls but at 64 bits: `64 - leading_zeros(x)`
+            // (0u64.leading_zeros() == 64, so the x == 0 case matches too).
+            Fls64,
+        }
+
+        let kind = match name {
+            "generic_fls" => Kind::Fls,
+            "generic___fls" => Kind::UnderscoreFls,
+            "generic___ffs" => Kind::UnderscoreFfs,
+            "fls64" => Kind::Fls64,
+            _ => return None,
+        };
+
+        let [(param_decl_id, _, param_qty)] = arguments else {
+            return None;
+        };
+        let param_type_kind = self.ast_context.resolve_type(param_qty.ctype).kind.clone();
+        let ret_qty = return_type?;
+        let ret_type_kind = self.ast_context.resolve_type(ret_qty.ctype).kind.clone();
+
+        // (unsigned Rust type to compute in, expected C parameter kind, expected C return kind)
+        let (rust_uty, expected_param, expected_ret): (&str, CTypeKind, CTypeKind) = match kind {
+            Kind::Fls => ("u32", CTypeKind::UInt, CTypeKind::Int),
+            Kind::UnderscoreFls => ("u64", CTypeKind::ULong, CTypeKind::UInt),
+            Kind::UnderscoreFfs => ("u64", CTypeKind::ULong, CTypeKind::UInt),
+            Kind::Fls64 => ("u64", CTypeKind::ULongLong, CTypeKind::Int),
+        };
+        if param_type_kind != expected_param || ret_type_kind != expected_ret {
+            return None;
+        }
+
+        let param_name = self.renamer.borrow().get(param_decl_id)?;
+        let param_expr = mk().ident_expr(&param_name);
+        let bits = mk().path_expr(vec![rust_uty, "BITS"]);
+        let lz = mk().method_call_expr(param_expr.clone(), "leading_zeros", vec![]);
+
+        let value_u: Box<Expr> = match kind {
+            // u32::BITS - x.leading_zeros()
+            Kind::Fls | Kind::Fls64 => mk().binary_expr(BinOp::Sub(Default::default()), bits, lz),
+            // u64::BITS - 1 - x.leading_zeros(), i.e. (u64::BITS - 1) - lz
+            Kind::UnderscoreFls => {
+                let bits_minus_one = mk().binary_expr(
+                    BinOp::Sub(Default::default()),
+                    bits,
+                    mk().lit_expr(mk().int_unsuffixed_lit(1)),
+                );
+                mk().binary_expr(BinOp::Sub(Default::default()), bits_minus_one, lz)
+            }
+            // x.trailing_zeros()
+            Kind::UnderscoreFfs => mk().method_call_expr(param_expr, "trailing_zeros", vec![]),
+        };
+
+        // leading_zeros()/trailing_zeros() both return u32; the two functions
+        // that return a C `int` (fls, fls64) need an explicit cast, since the
+        // computed value is always non-negative here (no C code path in the
+        // originals produces a negative result) and c_int is 32 bits, wide
+        // enough for the u32-domain fls result and for fls64's 0..=64 range.
+        let final_expr: Box<Expr> = match kind {
+            Kind::Fls | Kind::Fls64 => {
+                mk().cast_expr(value_u, mk().abs_path_ty(vec!["core", "ffi", "c_int"]))
+            }
+            Kind::UnderscoreFls | Kind::UnderscoreFfs => value_u,
+        };
+
+        // `stmts_block` (used by the normal function-body assembly path below)
+        // always appends a semicolon to the last statement, so a bare tail
+        // expression here would be turned into a statement discarding its
+        // value, leaving the function body evaluate to `()` against a
+        // non-unit return type. An explicit `return` avoids relying on tail
+        // position surviving that rewrite.
+        Some(vec![mk().semi_stmt(mk().return_expr(Some(final_expr)))])
     }
 
     fn convert_function_param(

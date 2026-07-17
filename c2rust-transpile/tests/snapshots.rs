@@ -58,6 +58,7 @@ fn config(edition: RustEdition) -> TranspilerConfig {
         log_level: log::LevelFilter::Warn,
         edition,
         deny_unsafe_op_in_unsafe_fn: false,
+        kernel_idiom_rules: Default::default(),
         postprocess: false,
         emit_build_files: false,
         binaries: Vec::new(),

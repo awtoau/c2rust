@@ -4,7 +4,7 @@ use regex::Regex;
 use std::{ffi::OsStr, fs, path::PathBuf};
 
 use c2rust_rust_tools::RustEdition;
-use c2rust_transpile::{Diagnostic, ReplaceMode, TranspilerConfig};
+use c2rust_transpile::{parse_rule_list, Diagnostic, KernelIdiomRule, ReplaceMode, TranspilerConfig};
 
 #[derive(Debug, Parser)]
 #[clap(
@@ -204,6 +204,15 @@ struct Args {
     #[clap(long)]
     deny_unsafe_op_in_unsafe_fn: bool,
 
+    /// Enable a named kernel-source-idiom rewrite (may be repeated, or given
+    /// as a comma-separated list). Off by default: with no --enable-rule
+    /// flags, output is a plain C-to-Rust transliteration with none of
+    /// these rewrites applied. Pass `all` to enable every rewrite this
+    /// build of c2rust knows about. See `c2rust_transpile::kernel_idioms`
+    /// for the full list and what each one recognizes/emits.
+    #[clap(long, multiple = true, number_of_values = 1)]
+    enable_rule: Vec<String>,
+
     /// Transpile every TU in the given compile_commands.json in-process
     /// (no per-file build-files/rustfmt/refactor postprocessing — see
     /// `c2rust_transpile::transpile_batch_with_results`'s doc comment),
@@ -283,6 +292,21 @@ enum InvalidCodes {
 fn main() {
     let args = Args::parse();
 
+    let kernel_idiom_rules: c2rust_transpile::KernelIdiomRules = args
+        .enable_rule
+        .iter()
+        .map(|s| {
+            parse_rule_list(s).unwrap_or_else(|e| {
+                panic!(
+                    "invalid --enable-rule value {s:?}: {e} (known rules: {}, {})",
+                    KernelIdiomRule::WarnOn,
+                    KernelIdiomRule::FlsFamily
+                )
+            })
+        })
+        .flatten()
+        .collect();
+
     // Build a TranspilerConfig from the command line
     let mut tcfg = TranspilerConfig {
         dump_untyped_context: args.dump_untyped_clang_ast,
@@ -342,6 +366,7 @@ fn main() {
         log_level: args.log_level,
         edition: args.edition,
         deny_unsafe_op_in_unsafe_fn: args.deny_unsafe_op_in_unsafe_fn,
+        kernel_idiom_rules,
     };
     // binaries imply emit-build-files
     if !tcfg.binaries.is_empty() {

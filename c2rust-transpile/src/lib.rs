@@ -8,6 +8,7 @@ pub mod c_ast;
 pub mod cfg;
 mod compile_cmds;
 pub mod convert_type;
+pub mod kernel_idioms;
 pub mod renamer;
 pub mod rust_ast;
 pub mod translator;
@@ -34,6 +35,7 @@ use which::which;
 use crate::c_ast::Printer;
 use crate::c_ast::*;
 pub use crate::diagnostics::{CapturedRecord, Diagnostic};
+pub use crate::kernel_idioms::{parse_rule_list, KernelIdiomRule, KernelIdiomRules};
 use c2rust_ast_exporter as ast_exporter;
 
 use crate::build_files::{emit_build_files, get_build_dir, CrateConfig};
@@ -109,6 +111,11 @@ pub struct TranspilerConfig {
     pub log_level: log::LevelFilter,
     pub edition: RustEdition,
     pub deny_unsafe_op_in_unsafe_fn: bool,
+
+    /// Kernel-source-idiom rewrites (see [`kernel_idioms`]) to apply during
+    /// translation. Empty by default — see that module's doc comment for
+    /// why an unrequested rewrite must never fire.
+    pub kernel_idiom_rules: KernelIdiomRules,
 
     /// Run `c2rust-postprocess` after transpiling and potentially refactoring.
     pub postprocess: bool,

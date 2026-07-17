@@ -49,6 +49,7 @@ fn config(output_dir: PathBuf) -> TranspilerConfig {
         log_level: log::LevelFilter::Warn,
         edition: RustEdition::Edition2021,
         deny_unsafe_op_in_unsafe_fn: false,
+        kernel_idiom_rules: Default::default(),
         postprocess: false,
         emit_build_files: true,
         binaries: vec!["main".to_owned()],

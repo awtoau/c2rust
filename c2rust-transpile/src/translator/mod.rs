@@ -3825,6 +3825,14 @@ impl<'c> Translation<'c> {
         expr_id: CExprId,
         compound_stmt_id: CStmtId,
     ) -> Option<CExprId> {
+        if !self
+            .tcfg
+            .kernel_idiom_rules
+            .is_enabled(crate::KernelIdiomRule::WarnOn)
+        {
+            return None;
+        }
+
         let macro_ids = self.ast_context.macro_invocations.get(&expr_id)?;
         let is_warn_on = macro_ids.iter().any(|macro_id| {
             matches!(
