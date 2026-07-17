@@ -554,10 +554,58 @@ fn tied_output_operand_idx(
     idx
 }
 
+/// Scan an (LLVM-syntax, `$`-escaped) asm template for any operand reference
+/// (`$N`, `$xN`, or `${N:mod}`) whose index is `>= min_idx`. Used to detect
+/// references to GNU asm-goto label operands, which are numbered
+/// contiguously after all outputs and inputs (see `GCCAsmStmt::begin_labels`
+/// in Clang) but are never extracted by the AST exporter or represented in
+/// `AsmOperand`/`CStmtKind::Asm`, so no input/output data exists for them.
+fn references_operand_at_or_beyond(asm: &str, min_idx: usize) -> bool {
+    let mut first = true;
+    let mut last_empty = false;
+    for chunk in asm.split('$') {
+        if first {
+            first = false;
+            continue;
+        }
+        if last_empty {
+            last_empty = false;
+            continue;
+        }
+        if chunk.is_empty() {
+            last_empty = true;
+            continue;
+        }
+
+        // ${N:mod} form
+        let digits: String = if let Some(rest) = chunk.strip_prefix('{') {
+            rest.chars()
+                .skip_while(|c| !c.is_ascii_digit())
+                .take_while(|c| c.is_ascii_digit())
+                .collect()
+        } else {
+            // $N or $xN form: skip a leading alphabetic modifier, if any
+            let rest = if chunk.starts_with(|c: char| c.is_ascii_alphabetic()) {
+                &chunk[1..]
+            } else {
+                chunk
+            };
+            rest.chars().take_while(|c| c.is_ascii_digit()).collect()
+        };
+
+        if let Ok(idx) = digits.parse::<usize>() {
+            if idx >= min_idx {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Rewrite a LLVM inline assembly template string into an asm!-compatible one
 /// by translating its references to operands (of the form $0 or $x0) to {0} or
 /// {0:y} (and wrapping mem-only references in square brackets).
-fn rewrite_asm<F: Fn(&str) -> bool, M: Fn(usize) -> usize>(
+fn rewrite_asm<F: Fn(&str) -> bool, M: Fn(usize) -> TranslationResult<usize>>(
     asm: &str,
     att_syntax: bool,
     input_op_mapper: M,
@@ -604,7 +652,7 @@ fn rewrite_asm<F: Fn(&str) -> bool, M: Fn(usize) -> usize>(
                         .trim_matches(|c: char| !c.is_ascii_digit())
                         .parse()
                         .map_err(|_| TranslationError::generic("could not parse operand idx"))?;
-                    out.push_str(input_op_mapper(idx).to_string().as_str());
+                    out.push_str(input_op_mapper(idx)?.to_string().as_str());
                     out.push(':');
                     let modifiers = ref_str[colon_idx + 1..].chars();
                     for modifier in modifiers {
@@ -655,7 +703,7 @@ fn rewrite_asm<F: Fn(&str) -> bool, M: Fn(usize) -> usize>(
             let idx: usize = index_str
                 .parse()
                 .map_err(|_| TranslationError::generic("could not parse operand idx"))?;
-            out.push_str(input_op_mapper(idx).to_string().as_str());
+            out.push_str(input_op_mapper(idx)?.to_string().as_str());
             if !new_modifiers.is_empty() {
                 out.push(':');
                 out.push_str(&new_modifiers);
@@ -707,6 +755,43 @@ impl<'c> Translation<'c> {
                 ))
             }
         };
+
+        // GCC/Clang extended asm supports a third operand class beyond
+        // outputs/inputs: "label operands" (GNU `asm goto`), referenced in the
+        // template via `%l[name]` / `${N:l}` (the `l` template modifier). These
+        // bind to C `goto` labels rather than expressions and are numbered
+        // contiguously *after* all outputs and inputs (Clang's `GCCAsmStmt`
+        // keeps a single `Exprs` array laid out as
+        // `[outputs..., inputs..., labels...]`, see `clang/AST/Stmt.h`
+        // `GCCAsmStmt::begin_labels()`).
+        //
+        // Neither the AST exporter (`AstExporter.cpp`'s `VisitGCCAsmStmt`) nor
+        // `CStmtKind::Asm`/`AsmOperand` on the Rust side model label operands
+        // at all: only `E->begin_inputs()/end_inputs()` and
+        // `E->begin_outputs()/end_outputs()` are walked, and only input/output
+        // constraint strings are encoded. So an asm template that references
+        // operand index `outputs.len() + inputs.len() + k` (a label operand)
+        // has no corresponding entry in `inputs`/`outputs` at all - not a bug
+        // in the lookup, but a construct we never extract from the Clang AST
+        // in the first place.
+        //
+        // Fully supporting this would mean plumbing a `labels: Vec<..>` field
+        // through the exporter and `CStmtKind::Asm`, and emitting Rust's own
+        // `asm!` label-operand syntax (`label { .. }`) - itself a genuine
+        // control-flow construct, not just another substitution. Given this
+        // transpiler is used here as a differential/reference tool (asm output
+        // is always hand-reviewed and reimplemented, never trusted as-is), we
+        // degrade gracefully instead: reject asm-goto statements up front with
+        // a clear error so the containing function is skipped with a warning,
+        // rather than translating a template with dangling operand references.
+        let num_extractable_operands = outputs.len() + inputs.len();
+        if references_operand_at_or_beyond(asm, num_extractable_operands) {
+            return Err(TranslationError::generic(
+                "Cannot translate GNU asm goto (extended asm with label operands): \
+                 label operands are not extracted from the Clang AST and have no \
+                 Rust `asm!` equivalent that can be generated automatically.",
+            ));
+        }
 
         self.use_feature("asm");
 
@@ -829,11 +914,26 @@ impl<'c> Translation<'c> {
         // Add workaround for reserved registers (e.g. rbx on x86_64)
         let (prolog, epilog) = rewrite_reserved_reg_operands(att_syntax, arch, &mut args);
 
-        // Find new idx by searching args for one with this original idx
-        let new_idx_for_orig = |orig_idx| {
+        // Find new idx by searching args for one with this original idx. This
+        // can legitimately fail to find a match for asm templates that
+        // reference operand indices we don't model at all (e.g. GNU asm-goto
+        // label operands; see the `references_operand_at_or_beyond` check
+        // above, which should already reject those before we get here). Treat
+        // any such miss as a translation error rather than panicking, so an
+        // unanticipated gap here degrades the containing function instead of
+        // aborting the whole transpile run.
+        let new_idx_for_orig = |orig_idx| -> TranslationResult<usize> {
             args.iter()
                 .position(|operand| operand.has_orig_idx(orig_idx))
-                .unwrap_or_else(|| panic!("no operand had index {orig_idx} in asm str:\n{asm}"))
+                .ok_or_else(|| {
+                    TranslationError::new(
+                        None,
+                        failure::err_msg(format!(
+                            "no operand had index {orig_idx} in asm str:\n{asm}"
+                        ))
+                        .context(TranslationErrorKind::Generic),
+                    )
+                })
         };
 
         // Rewrite arg references in assembly template
