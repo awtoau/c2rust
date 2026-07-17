@@ -4,7 +4,7 @@ use regex::Regex;
 use std::{ffi::OsStr, fs, path::PathBuf};
 
 use c2rust_rust_tools::RustEdition;
-use c2rust_transpile::{parse_rule_list, Diagnostic, KernelIdiomRule, ReplaceMode, TranspilerConfig};
+use c2rust_transpile::{parse_rule_list, Diagnostic, ReplaceMode, TranspilerConfig};
 
 #[derive(Debug, Parser)]
 #[clap(
@@ -298,10 +298,12 @@ fn main() {
         .map(|s| {
             parse_rule_list(s).unwrap_or_else(|e| {
                 panic!(
-                    "invalid --enable-rule value {s:?}: {e} (known rules: {}, {}, {})",
-                    KernelIdiomRule::WarnOn,
-                    KernelIdiomRule::FlsFamily,
-                    KernelIdiomRule::SwapMemSwap
+                    "invalid --enable-rule value {s:?}: {e} (known rules: {})",
+                    c2rust_transpile::all_named_rules()
+                        .iter()
+                        .map(|r| r.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 )
             })
         })

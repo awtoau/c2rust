@@ -41,6 +41,7 @@ fn immediate_expr_children(kind: &CExprKind) -> Vec<SomeId> {
     use crate::c_ast::CExprKind::*;
     match *kind {
         BadExpr => vec![],
+        AddrLabel(..) => vec![],
         DesignatedInitExpr(..) => vec![], // the relevant information will be found in the semantic initializer
         ShuffleVector(..) | ConvertVector(..) => vec![],
         OffsetOf(..) | Literal(..) | ImplicitValueInit(..) => vec![],
@@ -88,6 +89,7 @@ fn immediate_expr_children_all_types(kind: &CExprKind) -> Vec<SomeId> {
     use crate::c_ast::CExprKind::*;
     match *kind {
         BadExpr => vec![],
+        AddrLabel(..) => vec![],
         DesignatedInitExpr(..) => vec![], // the relevant information will be found in the semantic initializer
         ShuffleVector(_, ref kids) | ConvertVector(_, ref kids) => {
             kids.iter().map(|&x| x.into()).collect()

@@ -3226,6 +3226,21 @@ impl<'c> Translation<'c> {
             BadExpr => Err(TranslationError::generic(
                 "missing or unsupported expression in exported Clang AST",
             )),
+            AddrLabel(ty) => {
+                if self
+                    .tcfg
+                    .kernel_idiom_rules
+                    .is_enabled(crate::KernelIdiomRule::AddrLabelPlaceholder)
+                {
+                    self.implicit_default_expr(ctx, override_ty.unwrap_or(ty).ctype)
+                } else {
+                    Err(TranslationError::generic(
+                        "Cannot translate GNU address of label expression (&&label) — \
+                         no direct Rust equivalent; enable --enable-rule=addr-label-placeholder \
+                         to substitute a placeholder value",
+                    ))
+                }
+            }
             ShuffleVector(_, ref child_expr_ids) => self
                 .convert_shuffle_vector(ctx, child_expr_ids)
                 .map_err(|e| {
@@ -3738,6 +3753,33 @@ impl<'c> Translation<'c> {
                 let name = format!("<stmt-expr_{:?}>", compound_stmt_id);
                 let lbl_ident = self.renamer.borrow_mut().pick_name("c2rust_label");
                 let lbl = cfg::Label::FromC(compound_stmt_id, Some(Rc::from(lbl_ident)));
+
+                // `_THIS_IP_`'s expansion (`{ __label__ __here; __here:
+                // (unsigned long)&&__here; }`) ends in a `LabelStmt`
+                // wrapping the result expression, not a bare `Expr`
+                // statement — Clang requires a statement after a label, so
+                // GCC's statement-expression form of this idiom always has
+                // this shape. Without unwrapping it, the block below falls
+                // into the `_` arm as a void statement expression, silently
+                // discarding the placeholder value `AddrLabel` produces
+                // (verified: produces `'label: {};` typed as `()` against
+                // an `unsigned long`-returning caller, a real compile
+                // error). Only unwrapped when the rule that can actually
+                // produce a value for the inner `AddrLabelExpr` is enabled,
+                // so an unrelated statement-expression that happens to end
+                // in a label keeps today's exact behavior by default.
+                let result_id = if self
+                    .tcfg
+                    .kernel_idiom_rules
+                    .is_enabled(crate::KernelIdiomRule::AddrLabelPlaceholder)
+                {
+                    match self.ast_context[result_id].kind {
+                        CStmtKind::Label(inner_id) => inner_id,
+                        _ => result_id,
+                    }
+                } else {
+                    result_id
+                };
 
                 let mut stmts = match self.ast_context[result_id].kind {
                     CStmtKind::Expr(expr_id) => {

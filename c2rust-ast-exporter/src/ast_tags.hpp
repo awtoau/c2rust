@@ -86,6 +86,7 @@ enum ASTEntryTag {
     // GNU extensions
     TagStmtExpr,
     TagChooseExpr,
+    TagAddrLabelExpr,
 
     TagAtomicExpr,
     TagTypeTraitExpr,

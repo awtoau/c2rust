@@ -52,6 +52,24 @@ pub enum KernelIdiomRule {
     /// b)` instead of transliterating the `typeof(a) __tmp = (a); (a) =
     /// (b); (b) = __tmp;` temp-variable dance.
     SwapMemSwap,
+
+    /// Recognize the kernel's `_THIS_IP_` macro (`({ __label__ __here;
+    /// __here: (unsigned long)&&__here; })`, GCC's label-as-value
+    /// extension used to get an approximate current instruction address
+    /// for debug/lockdep annotation — matched by macro-origin, since the
+    /// enclosing `StmtExpr` is an `Expr` and carries macro-expansion
+    /// provenance the same way `WARN_ON`'s does) and emit a placeholder
+    /// value of the expression's own type instead of failing to translate
+    /// the unrepresentable `&&label` address-of-label expression at all.
+    /// Not a real program-counter capture: every use of `_THIS_IP_` in
+    /// this corpus flows only into lockdep-internal debug sinks that are
+    /// no-ops when `CONFIG_LOCKDEP` is off, and Rust has no stable
+    /// equivalent that fits the `unsigned long` call-site shape
+    /// (`core::panic::Location::caller()` is a different type and needs
+    /// `#[track_caller]` threaded through call chains that don't have
+    /// it) — this preserves the call shape at each `_THIS_IP_` use site
+    /// without reimplementing lockdep's own tracking.
+    AddrLabelPlaceholder,
 }
 
 /// The active set of [`KernelIdiomRule`]s for one transpile run.
@@ -75,6 +93,18 @@ impl FromIterator<KernelIdiomRule> for KernelIdiomRules {
     fn from_iter<I: IntoIterator<Item = KernelIdiomRule>>(iter: I) -> Self {
         Self(iter.into_iter().collect())
     }
+}
+
+/// Every named (non-`All`) rule, for building "known rules" help/error text
+/// without hand-maintaining a second list that drifts from the enum itself
+/// — see the CLI's `--enable-rule` error message.
+pub fn all_named_rules() -> &'static [KernelIdiomRule] {
+    &[
+        KernelIdiomRule::WarnOn,
+        KernelIdiomRule::FlsFamily,
+        KernelIdiomRule::SwapMemSwap,
+        KernelIdiomRule::AddrLabelPlaceholder,
+    ]
 }
 
 /// Parse one `--enable-rule` value, which may itself be a comma-separated

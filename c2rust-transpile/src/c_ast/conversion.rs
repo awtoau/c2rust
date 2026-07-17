@@ -2051,6 +2051,15 @@ impl ConversionContext {
                     self.expr_possibly_as_stmt(expected_ty, new_id, node, e)
                 }
 
+                ASTEntryTag::TagAddrLabelExpr => {
+                    let ty = node.type_id.expect("Expected expression to have type");
+                    let ty = self.visit_qualified_type(ty);
+
+                    let e = CExprKind::AddrLabel(ty);
+
+                    self.expr_possibly_as_stmt(expected_ty, new_id, node, e)
+                }
+
                 ASTEntryTag::TagAtomicExpr => {
                     let name = from_value::<String>(node.extras[0].clone())
                         .expect("Expected to find builtin operator name");

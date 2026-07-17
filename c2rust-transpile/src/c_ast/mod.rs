@@ -919,6 +919,7 @@ impl TypedAstContext {
             DeclRef(_, _, _) |
             UnaryType(_, _, _, _) |
             OffsetOf(..) |
+            AddrLabel(..) |
             ConstantExpr(..) => true,
 
             DesignatedInitExpr(_,_,e) |
@@ -974,6 +975,11 @@ impl TypedAstContext {
         match self[expr].kind {
             // A literal is always `const`.
             Literal(_, _) => true,
+            // The placeholder value substituted for a GNU address-of-label
+            // expression (see AddrLabel's own doc comment) is a compile-time
+            // constant when the KernelIdiomRule that emits it is enabled;
+            // pessimistically `const` either way, matching Literal.
+            AddrLabel(_) => true,
             // Unary ops should be `const`.
             // TODO handle `f128` or use the primitive type.
             Unary(_, _, expr, _) => is_const(expr),
@@ -1898,6 +1904,14 @@ pub enum CExprKind {
     },
 
     BadExpr,
+
+    /// GNU address-of-label expression (`&&label`). No real Rust equivalent
+    /// exists for a label's address; this is a placeholder distinct from
+    /// `BadExpr` (which always fails the containing translation) so a
+    /// `KernelIdiomRule`-gated caller can substitute a value while `--enable-
+    /// rule` being unset preserves today's translation-error behavior for
+    /// this one expression.
+    AddrLabel(CQualTypeId),
 }
 
 #[derive(Copy, Debug, Clone)]
@@ -1952,6 +1966,7 @@ impl CExprKind {
             | CExprKind::DesignatedInitExpr(ty, _, _)
             | CExprKind::ConstantExpr(ty, _, _) => Some(ty),
             CExprKind::Choose(ty, _, _, _, _) | CExprKind::Atomic { typ: ty, .. } => Some(ty),
+            CExprKind::AddrLabel(ty) => Some(ty),
         }
     }
 

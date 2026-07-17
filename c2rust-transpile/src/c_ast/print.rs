@@ -83,6 +83,9 @@ impl<W: Write> Printer<W> {
             BadExpr => {
                 self.writer.write_all(b"BAD")?;
             }
+            AddrLabel(..) => {
+                self.writer.write_all(b"ADDR_LABEL")?;
+            }
             DesignatedInitExpr(..) => {
                 self.writer.write_all(b"DESIGNATED INIT EXPR")?;
             }

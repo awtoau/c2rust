@@ -2108,7 +2108,20 @@ class TranslateASTVisitor final
     }
 
     bool VisitAddrLabelExpr(AddrLabelExpr *E) {
-        printDiag(Context, DiagnosticsEngine::Warning, "Cannot translate GNU address of label expression", E);
+        // No real Rust equivalent for a GCC label-as-value address (&&label)
+        // exists — unlike every other Expr here, this always encodes rather
+        // than gating on some translatable/untranslatable distinction, since
+        // whether c2rust-transpile does something useful with the node is
+        // entirely a Rust-side decision (see KernelIdiomRule::AddrLabel):
+        // dropping the node here, as before, leaves a hole in the parent's
+        // child-id list that cascades into unrelated "Missing child"/"missing
+        // decl" failures further down the pipeline, which is strictly worse
+        // than always encoding and letting the Rust side decide.
+        std::vector<void *> childIds;
+        encode_entry(E, TagAddrLabelExpr, childIds,
+                     [E](CborEncoder *array) {
+                         cbor_encode_text_stringz(array, E->getLabel()->getName().str().c_str());
+                     });
         return true;
     }
 

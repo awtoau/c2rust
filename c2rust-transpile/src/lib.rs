@@ -35,7 +35,7 @@ use which::which;
 use crate::c_ast::Printer;
 use crate::c_ast::*;
 pub use crate::diagnostics::{CapturedRecord, Diagnostic};
-pub use crate::kernel_idioms::{parse_rule_list, KernelIdiomRule, KernelIdiomRules};
+pub use crate::kernel_idioms::{all_named_rules, parse_rule_list, KernelIdiomRule, KernelIdiomRules};
 use c2rust_ast_exporter as ast_exporter;
 
 use crate::build_files::{emit_build_files, get_build_dir, CrateConfig};
