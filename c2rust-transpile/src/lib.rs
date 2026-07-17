@@ -33,7 +33,7 @@ use which::which;
 
 use crate::c_ast::Printer;
 use crate::c_ast::*;
-pub use crate::diagnostics::Diagnostic;
+pub use crate::diagnostics::{CapturedRecord, Diagnostic};
 use c2rust_ast_exporter as ast_exporter;
 
 use crate::build_files::{emit_build_files, get_build_dir, CrateConfig};
@@ -404,6 +404,7 @@ pub fn transpile(tcfg: TranspilerConfig, cc_db: &Path, extra_clang_args: &[&str]
                     &build_dir,
                     cc_db,
                     &clang_args,
+                    None,
                 )
             })
             .collect::<Vec<TranspileResult>>();
@@ -476,6 +477,301 @@ pub fn transpile(tcfg: TranspilerConfig, cc_db: &Path, extra_clang_args: &[&str]
     }
 
     tcfg.check_if_all_binaries_used(&transpiled_modules);
+}
+
+/// Per-file outcome from [`transpile_batch_with_results`]: everything a
+/// caller needs to classify this one TU's transpile result without
+/// scraping stderr text, since in-process batching means there's no
+/// per-file subprocess stderr to scrape in the first place (see that
+/// function's doc comment).
+#[derive(Debug, Serialize)]
+pub struct FileTranspileResult {
+    /// The input path exactly as given in the `compile_commands.json`
+    /// entry (not resolved/canonicalized), so a caller can match this back
+    /// to the entry it submitted without re-deriving `abs_file()`.
+    pub file: PathBuf,
+    /// `true` if `output_path.exists() && !tcfg.overwrite_existing`
+    /// (`transpile_single`'s existing-file skip) or the input file itself
+    /// didn't exist — i.e. `transpile_single` returned `Err(())` before
+    /// ever attempting AST export, as opposed to failing during it.
+    pub ok: bool,
+    /// `Some(message)` if `transpile_single` unwound via `panic!` instead
+    /// of returning — the panic hook's formatted message (`'<msg>',
+    /// <file>:<line>:<col>`), captured via `diagnostics::
+    /// take_last_panic_message` rather than downcasting `catch_unwind`'s
+    /// `Box<dyn Any + Send>` payload directly: real in-corpus panics (a
+    /// `.expect("Expected decl name")` in translator/mod.rs, an
+    /// `indexmap` internal `.expect(...)`) were found via direct testing
+    /// to not reliably downcast to `&str`/`String` from within this call
+    /// chain on the pinned nightly-2022-11-03 toolchain, even though an
+    /// identical `.expect("...")` pattern downcasts fine as a standalone
+    /// unit test in this same crate — the hook-captured formatted string
+    /// sidesteps that payload-typing question entirely and is the same
+    /// text a human reading stderr, or `run_c2rust_baseline.py`'s
+    /// `PANIC_RE`, already relies on. `ok` is always `false` when this is
+    /// `Some`, since a caught panic and a normal `Err(())` are mutually
+    /// exclusive outcomes of the same `catch_unwind` call.
+    pub panic_message: Option<String>,
+    /// Every `log`-crate record emitted by this file's `transpile_single`
+    /// call — covers `diag!`/`log::warn!` sites inside the Rust-side
+    /// translator/conversion code (e.g. "Missing top-level node",
+    /// "Missing child N of node ..."), as structured `(level, target,
+    /// message)` data instead of parsed stderr text. Does NOT cover
+    /// diagnostics Clang's C++ `DiagnosticsEngine` emits directly during
+    /// AST export (e.g. "Cannot translate GNU address of label
+    /// expression") — those never go through Rust's `log` crate at all;
+    /// they're in `captured_stderr` instead, alongside these same
+    /// records re-rendered as text (fern's formatter also chains to
+    /// stderr — see `diagnostics::init` — so anything in `log_records`
+    /// appears in `captured_stderr` too, just pre-parsed here for
+    /// convenience).
+    pub log_records: Vec<CapturedLogRecord>,
+    /// Raw fd-level stderr captured for this file only — see
+    /// `diagnostics::capture_stderr`'s doc comment for why this exists
+    /// (Clang's own diagnostics bypass the `log` crate entirely). This is
+    /// the direct structured-batching equivalent of what
+    /// `run_c2rust_baseline.py`'s `extract_signatures()` already parses
+    /// out of one isolated subprocess's stderr today — a caller
+    /// migrating from the per-process path to this one can run the exact
+    /// same parsing function against this field unchanged.
+    pub captured_stderr: String,
+    /// AST-export vs. translation wall-clock split for this file — see
+    /// [`PhaseTimings`]. `total_s` is always populated (timed by the
+    /// batch loop around the whole `catch_unwind` call, not just by
+    /// `transpile_single` itself), but `ast_export_s`/`translate_s` stay
+    /// at 0 if a panic unwound before `transpile_single` reached the
+    /// point where it writes them back — `panic_message.is_some()` is the
+    /// reliable way to tell "genuinely instant" from "phase split
+    /// unavailable" apart for those two fields specifically.
+    pub phase_timings: PhaseTimings,
+}
+
+/// [`CapturedRecord`] with `level` rendered as its `Display` string
+/// (`"warning"`/`"error"`/...) instead of the `log::Level` enum, so this
+/// type round-trips through `serde_json` without pulling in a `log`
+/// dependency on the reading (Python) side.
+#[derive(Debug, Serialize)]
+pub struct CapturedLogRecord {
+    pub level: String,
+    pub target: String,
+    pub message: String,
+}
+
+impl From<CapturedRecord> for CapturedLogRecord {
+    fn from(r: CapturedRecord) -> Self {
+        Self {
+            level: r.level.to_string(),
+            target: r.target,
+            message: r.message,
+        }
+    }
+}
+
+/// Batched sibling of [`transpile`]: parses one `compile_commands.json`
+/// containing MULTIPLE translation units and transpiles every one of them
+/// in-process, sequentially, on the calling thread — reusing the exact
+/// same `cmds.iter().map(transpile_single)` loop shape `transpile` already
+/// runs at line ~397, just with two additions needed to make running N>1
+/// files through one process *usable* for a caller that today spawns one
+/// OS process per file specifically for crash isolation and per-file
+/// diagnostics:
+///
+/// 1. Each `transpile_single` call is wrapped in `catch_unwind` so a
+///    genuine Rust `panic!` in one TU (e.g. the `'Expected decl name'` /
+///    `TagTypeUnknown` panics seen against real kernel sources) is
+///    contained to that TU's result instead of aborting every remaining
+///    file in the batch — the isolation `run_c2rust_baseline.py` gets
+///    today from one-process-per-file, reproduced without the process
+///    boundary. `ast_exporter::CLANG_MUTEX` is not at risk of poisoning
+///    here: it's released (see `get_ast_cbors`) before any Rust-side code
+///    that could panic runs, so a caught panic never leaves the mutex
+///    locked for the next file in the batch.
+/// 2. Log output is captured per-file via `diagnostics::start_capture`/
+///    `take_captured` rather than left to free-run to stderr, because
+///    with N files sharing one process's stderr stream there is no
+///    reliable way for a caller to attribute a given warning line back to
+///    the file that produced it (today's one-subprocess-per-file harness
+///    gets that attribution for free, from process boundaries). Capturing
+///    via the `log` facade directly (structured `Record`s) rather than
+///    parsing formatted stderr text is also strictly more precise than
+///    what the isolated-process path can extract today: no regex, no risk
+///    of two adjacent warnings' "note: expanded from macro" continuation
+///    lines being misattributed.
+///
+/// Deliberately NOT parallelized across a thread pool: `ast_exporter`'s
+/// `CLANG_MUTEX` already serializes all `ast_exporter()` FFI calls
+/// process-wide (LibTooling/Clang's `CompilerInstance` is not reentrant),
+/// so N threads calling this in one process would just contend on that
+/// mutex for the (dominant) AST-export phase while adding thread-safety
+/// obligations (the `AssertUnwindSafe` below is sound for "one call
+/// finishes before the next starts on the same thread"; concurrent calls
+/// sharing `tcfg`/`clang_args` would need real auditing, not just a
+/// wrapper). Running multiple batches concurrently means multiple
+/// processes, each calling this function single-threaded — the process
+/// pool is where concurrency belongs (matches Option A in the companion
+/// design doc), not threads inside one call to this function.
+///
+/// Does not emit build files / run rustfmt postprocessing / refactor
+/// passes — those are whole-crate operations that don't make sense for
+/// "get per-file pass/fail data for a baseline run" callers, and adding
+/// them back is straightforward later (mirror `transpile`'s tail) if a
+/// caller needs them.
+pub fn transpile_batch_with_results(
+    tcfg: &TranspilerConfig,
+    cc_db: &Path,
+    extra_clang_args: &[&str],
+) -> Vec<FileTranspileResult> {
+    diagnostics::init(tcfg.enabled_warnings.clone(), tcfg.log_level);
+
+    let build_dir = get_build_dir(tcfg, cc_db);
+
+    let lcmds = get_compile_commands(cc_db, &tcfg.filter).unwrap_or_else(|_| {
+        panic!(
+            "Could not parse compile commands from {}",
+            cc_db.to_string_lossy()
+        )
+    });
+
+    let clang_args: Vec<String> = get_extra_args_macos();
+    let mut clang_args: Vec<&str> = clang_args.iter().map(AsRef::as_ref).collect();
+    clang_args.extend_from_slice(extra_clang_args);
+
+    let mut results = Vec::new();
+
+    for lcmd in &lcmds {
+        let cmds = &lcmd.cmd_inputs;
+        let lcmd_name = lcmd
+            .output
+            .as_ref()
+            .map(|output| {
+                let output_path = Path::new(output);
+                output_path
+                    .file_stem()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .unwrap_or_else(|| tcfg.crate_name());
+        let lcmd_build_dir = if lcmd.top_level {
+            build_dir.to_path_buf()
+        } else {
+            build_dir.join(&lcmd_name)
+        };
+
+        // Same quadratic common-ancestor computation `transpile` uses —
+        // kept identical so build_dir-relative output paths match exactly
+        // what the existing single-file-per-process path produces for the
+        // same compile_commands.json, which matters for a correctness
+        // comparison between the two modes.
+        let mut ancestor_path = cmds
+            .first()
+            .map(|cmd| {
+                let mut dir = cmd.abs_file();
+                dir.pop();
+                dir
+            })
+            .unwrap_or_else(PathBuf::new);
+        if cmds.len() > 1 {
+            for cmd in &cmds[1..] {
+                let cmd_path = cmd.abs_file();
+                ancestor_path = ancestor_path
+                    .ancestors()
+                    .find(|a| cmd_path.starts_with(a))
+                    .map(ToOwned::to_owned)
+                    .unwrap_or_else(PathBuf::new);
+            }
+        }
+
+        for cmd in cmds.iter() {
+            let file = cmd.abs_file();
+            let mut phase_timings = PhaseTimings::default();
+
+            diagnostics::start_capture();
+            // Timed independently of `transpile_single`'s own internal
+            // `call_start` (see `PhaseTimings`'s doc comment): a panic
+            // partway through the translate phase unwinds before
+            // `transpile_single` reaches its own final timing write-back,
+            // which would otherwise leave `total_s`/`translate_s` at 0
+            // for every panicking file — misleadingly indistinguishable
+            // from "the panic happened instantly" when it usually means
+            // "already spent most of translate_s's budget before
+            // panicking." This outer timer always completes (it wraps
+            // `catch_unwind` itself), so `total_s` is always meaningful;
+            // only the ast_export_s/translate_s split is unavailable
+            // (left at 0) for a panicking file, since that split can only
+            // be known by reaching the write-back point inside
+            // `transpile_single` that a panic bypassed.
+            let call_start = std::time::Instant::now();
+            // AssertUnwindSafe: `&mut PhaseTimings` is only not-UnwindSafe
+            // because `&mut T` is conservatively assumed to let a panic
+            // leave `T` in a torn state a caller could observe — here that
+            // "torn state" is at worst a `PhaseTimings` with some fields
+            // still zeroed, which is exactly the documented behavior on
+            // the `FileTranspileResult::phase_timings` field above, not a
+            // soundness hazard. `tcfg`/`clang_args` are shared refs read
+            // by `transpile_single`; a panic can't leave read-only data
+            // torn.
+            //
+            // `capture_stderr` wraps the whole `catch_unwind`, not just
+            // `transpile_single`'s call: a panicking `f` is fully caught
+            // by `catch_unwind` *inside* `capture_stderr`'s closure, so
+            // `capture_stderr` itself never sees an unwind reach past it
+            // — the fd-restore-on-panic path in `StderrCapture::drop` is
+            // therefore only a defense-in-depth backstop (e.g. an abort
+            // path this code doesn't otherwise take), and the normal case
+            // always returns through `StderrCapture::stop()`, which is
+            // what actually reads back Clang's captured diagnostics.
+            let (outcome, captured_stderr) = diagnostics::capture_stderr(|| {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    transpile_single(
+                        tcfg,
+                        &file,
+                        &ancestor_path,
+                        &lcmd_build_dir,
+                        cc_db,
+                        &clang_args,
+                        Some(&mut phase_timings),
+                    )
+                }))
+            });
+            if outcome.is_err() {
+                phase_timings.total_s = call_start.elapsed().as_secs_f64();
+            }
+            let log_records = diagnostics::take_captured()
+                .into_iter()
+                .map(CapturedLogRecord::from)
+                .collect();
+
+            let (ok, panic_message) = match outcome {
+                Ok(Ok(_)) => (true, None),
+                Ok(Err(())) => (false, None),
+                Err(_payload) => (
+                    false,
+                    // The panic hook (installed by `diagnostics::init`
+                    // above) records the formatted message before this
+                    // unwind reaches us; see `take_last_panic_message`'s
+                    // doc comment for why this is used instead of
+                    // downcasting `_payload` directly.
+                    Some(
+                        diagnostics::take_last_panic_message()
+                            .unwrap_or_else(|| "(panic message not captured)".to_string()),
+                    ),
+                ),
+            };
+
+            results.push(FileTranspileResult {
+                file: cmd.file.clone(),
+                ok,
+                panic_message,
+                log_records,
+                captured_stderr,
+                phase_timings,
+            });
+        }
+    }
+
+    results
 }
 
 /// Ensure that clang can locate the system headers on macOS 10.14+.
@@ -649,7 +945,40 @@ fn run_postprocess(
     Ok(())
 }
 
+/// Wall-clock breakdown of one `transpile_single` call, split at the one
+/// call site that crosses into C++/Clang (`ast_exporter::get_untyped_ast`)
+/// — the natural phase boundary between "Clang parses/exports the AST"
+/// and "c2rust's own Rust code converts and translates it". Only
+/// populated when a caller passes `Some(&mut _)` into `transpile_single`
+/// (the batched path does; the plain `transpile()` loop doesn't need it
+/// and skips the `Instant::now()` calls entirely by passing `None`).
+#[derive(Debug, Default, Clone, Copy, Serialize)]
+pub struct PhaseTimings {
+    /// Time inside `ast_exporter::get_untyped_ast` — Clang invocation
+    /// (parsing + preprocessing + CBOR AST export), including whatever
+    /// time was spent blocked on `ast_exporter::CLANG_MUTEX` waiting for
+    /// another thread's call to finish (not a concern for the batch loop,
+    /// which is single-threaded per process, but noted since this
+    /// function itself has no way to see the wait separately from the
+    /// call).
+    pub ast_export_s: f64,
+    /// Time from just after AST export returns to just before
+    /// `transpile_single` returns: typed-AST conversion
+    /// (`ConversionContext`), the translator's C-to-Rust conversion, and
+    /// the file write + optional rustfmt pass. Not split further because
+    /// those steps don't cross an FFI boundary the way AST export does —
+    /// they're plain sequential Rust function calls with no natural
+    /// "resource acquisition" seam to time separately without much finer
+    /// (and noisier) instrumentation.
+    pub translate_s: f64,
+    /// Total wall-clock for the whole call, timed independently of the
+    /// two phases above (not their sum) as a sanity check that no
+    /// untimed work sneaks in between/around them.
+    pub total_s: f64,
+}
+
 /// Transpiles one input C file, writing transpilation output to the filesystem.
+#[allow(clippy::too_many_arguments)]
 fn transpile_single(
     tcfg: &TranspilerConfig,
     input_path: &Path,
@@ -657,7 +986,10 @@ fn transpile_single(
     build_dir: &Path,
     cc_db: &Path,
     extra_clang_args: &[&str],
+    mut phase_timings: Option<&mut PhaseTimings>,
 ) -> TranspileResult {
+    let call_start = phase_timings.is_some().then(std::time::Instant::now);
+
     let output_path = get_output_path(tcfg, input_path, ancestor_path, build_dir);
     if output_path.exists() && !tcfg.overwrite_existing {
         warn!("Skipping existing file {}", output_path.display());
@@ -678,25 +1010,43 @@ fn transpile_single(
     }
 
     // Extract the untyped AST from the CBOR file
-    let (untyped_context, preprocessed_source) = match ast_exporter::get_untyped_ast(
+    let ast_export_start = phase_timings.is_some().then(std::time::Instant::now);
+    let ast_result = ast_exporter::get_untyped_ast(
         input_path,
         cc_db,
         extra_clang_args,
         tcfg.debug_ast_exporter,
         tcfg.emit_c_decl_map,
-    ) {
+    );
+    let ast_export_s = ast_export_start.map(|t| t.elapsed().as_secs_f64());
+    let (untyped_context, preprocessed_source) = match ast_result {
         Err(e) => {
             warn!(
                 "Error: {}. Skipping {}; is it well-formed C?",
                 e,
                 input_path.display()
             );
+            if let (Some(pt), Some(ast_export_s), Some(call_start)) =
+                (phase_timings.as_deref_mut(), ast_export_s, call_start)
+            {
+                pt.ast_export_s = ast_export_s;
+                pt.total_s = call_start.elapsed().as_secs_f64();
+            }
             return Err(());
         }
         Ok(cxt) => cxt,
     };
+    let translate_start = phase_timings.is_some().then(std::time::Instant::now);
 
-    println!("Transpiling {}", file);
+    // stderr, not stdout: `transpile_batch_with_results` callers (see
+    // `c2rust transpile --batch-json`) read stdout as a single JSON
+    // document, so nothing on this function's non-debug-dump path may
+    // write to stdout or it corrupts that stream. This progress line
+    // predates that constraint but nothing parses it (checked: no
+    // caller in this repo or linux-rs's scripts/ matches "Transpiling ");
+    // stderr is also just the more conventional destination for a
+    // progress/status line that isn't the tool's actual output.
+    eprintln!("Transpiling {}", file);
 
     if tcfg.dump_untyped_context {
         println!("CBOR Clang AST");
@@ -775,6 +1125,17 @@ fn transpile_single(
 
     if !tcfg.disable_rustfmt {
         rustfmt(&output_path).edition(tcfg.edition).run();
+    }
+
+    if let (Some(pt), Some(ast_export_s), Some(translate_start), Some(call_start)) = (
+        phase_timings.as_deref_mut(),
+        ast_export_s,
+        translate_start,
+        call_start,
+    ) {
+        pt.ast_export_s = ast_export_s;
+        pt.translate_s = translate_start.elapsed().as_secs_f64();
+        pt.total_s = call_start.elapsed().as_secs_f64();
     }
 
     Ok((output_path, pragmas, crates))

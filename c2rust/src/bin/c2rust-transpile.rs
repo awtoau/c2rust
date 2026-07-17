@@ -203,6 +203,22 @@ struct Args {
     /// Deny `unsafe_op_in_unsafe_fn` and wrap unsafe fn bodies in unsafe blocks
     #[clap(long)]
     deny_unsafe_op_in_unsafe_fn: bool,
+
+    /// Transpile every TU in the given compile_commands.json in-process
+    /// (no per-file build-files/rustfmt/refactor postprocessing — see
+    /// `c2rust_transpile::transpile_batch_with_results`'s doc comment),
+    /// printing one JSON array to stdout: per-file pass/panic outcome,
+    /// captured log records and raw stderr (structured equivalent of
+    /// parsing one isolated subprocess's stderr today), and AST-export/
+    /// translate/total phase timings. Intended as a batched alternative
+    /// to spawning one `c2rust transpile` process per file. Real stderr
+    /// (fd 2) is redirected per-file into each result's `captured_stderr`
+    /// field rather than streamed live — see `diagnostics::capture_stderr`
+    /// — so this process's own stderr stays quiet while a batch runs;
+    /// only the one JSON array on stdout carries output, which is also
+    /// what keeps stdout parseable as a single JSON document.
+    #[clap(long)]
+    batch_json: bool,
 }
 
 // TODO Eventually move this code into `c2rust-transpile`
@@ -372,7 +388,15 @@ fn main() {
         .map(AsRef::as_ref)
         .collect::<Vec<_>>();
 
-    c2rust_transpile::transpile(tcfg, &compile_commands, &extra_args);
+    if args.batch_json {
+        let results =
+            c2rust_transpile::transpile_batch_with_results(&tcfg, &compile_commands, &extra_args);
+        let stdout = std::io::stdout();
+        serde_json::to_writer(stdout.lock(), &results)
+            .expect("failed to write batch JSON results to stdout");
+    } else {
+        c2rust_transpile::transpile(tcfg, &compile_commands, &extra_args);
+    }
 
     // Remove the temporary compile_commands.json if it was created
     if let Some(temp) = temp_compile_commands_dir {

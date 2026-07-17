@@ -282,6 +282,7 @@ dependencies = [
  "is_executable",
  "log",
  "regex",
+ "serde_json",
  "shlex",
 ]
 
@@ -501,6 +502,7 @@ dependencies = [
  "indexmap",
  "insta",
  "itertools 0.10.5",
+ "libc",
  "log",
  "log-reroute",
  "pathdiff",
