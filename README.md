@@ -10,6 +10,48 @@
 [crates.io]: https://crates.io/crates/c2rust
 [rustc Version]: https://img.shields.io/badge/rustc-nightly--2022--11--03-lightgrey.svg "rustc nightly-2022-11-03"
 
+## About this fork
+
+This is [awtoau](https://github.com/awtoau)'s fork of upstream
+[immunant/c2rust](https://github.com/immunant/c2rust), maintained to support
+[linux-rs](https://github.com/awtoau) — a port of Linux kernel `lib/*.c`
+files to Rust. **The goal for this fork is for `c2rust transpile` to
+become linux-rs's primary translation source** — not just a reference
+tool — by fixing it until its output reliably conforms to linux-rs's
+rule-cited translation discipline (every deviation from literal C
+semantics must be either Rust-forced or explicitly licensed by a cited
+rule) for real kernel `lib/*.c` source.
+
+Getting there is staged. Right now (stage 1) the priority is
+reliability: get `c2rust transpile` to run over the full corpus without
+crashing or hanging, fixing genuine gaps in its C-construct coverage —
+see [issue #1](https://github.com/awtoau/c2rust/issues/1) for the
+running log. Once transpilation itself is reliable, later stages target
+output quality directly, potentially including changes to
+`c2rust transpile` itself and/or a linux-rs-side normalization pass, so
+its output moves from "unsafe, unidiomatic, but functionally faithful"
+(c2rust's own stated design goal, see below) toward what linux-rs's
+rules require.
+
+Regardless of how good the output gets, **landing still goes through
+linux-rs's full verification pipeline** — build, a differential oracle
+against the original C, a QEMU boot, and the kernel's KUnit test
+suites — the same bar every translation in linux-rs is held to,
+whether hand-written or c2rust-derived. That bar exists because
+"compiles and passes tests" has already been shown, empirically, in
+this project, to be insufficient on its own to catch semantic drift
+(a translation can compile clean and still be wrong in ways tests don't
+happen to exercise); the pipeline, not the origin of the draft, is what
+decides what lands.
+
+Patches in this fork are written to be general fixes (not narrow
+kernel-only special-cases) wherever the underlying gap is a real one in
+`c2rust`'s C-construct coverage — things like GCC extended-asm label
+operands (`asm goto`), architecture-conditional builtin vector types,
+and `_Pragma`-based loop-unroll attributes, all real gaps against
+kernel source that upstream's existing test corpus doesn't happen to
+exercise — and are intended to be upstreamable.
+
 <!-- ANCHOR: intro -->
 
 ## Intro
@@ -397,6 +439,7 @@ This is a list of all significant uses of `c2rust transpile` that we know of:
 | [`spiro.rlib`](https://github.com/MFEK/spiro.rlib) | [`spiro`](https://github.com/raphlinus/spiro) | @ctrlcctrlv | fully safe | spline interpolation |
 | [`sapp-kms`](https://crates.io/crates/sapp-kms) | [`sokol`](https://github.com/floooh/sokol) | @not-fl3 | cleaned up, still unsafe | application rendering library |
 | `lhdcv5` | *(unknown)* | *(unknown)* | fully safe | Bluetooth audio codec |
+| [`linux-rs`](https://github.com/awtoau) | [Linux kernel](https://kernel.org) `lib/*.c` | @awtoau | unsafe FFI-shim style; landing bar is build + differential oracle + boot + KUnit, not `c2rust` output trusted blind | riscv64 kernel `lib/` port; this fork's patches target making `c2rust` a reliable primary source for it (see [About this fork](#about-this-fork)) |
 
 If any other project successfully uses `c2rust`, feel free to add your ported project here.
 
