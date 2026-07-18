@@ -15,6 +15,7 @@ use indexmap::{IndexMap, IndexSet};
 use itertools::Itertools;
 use log::{error, trace, warn};
 use proc_macro2::{Punct, Spacing::*, Span, TokenStream, TokenTree};
+use regex::Regex;
 use serde_derive::Serialize;
 use syn::spanned::Spanned as _;
 use syn::{
@@ -285,6 +286,15 @@ pub struct Translation<'c> {
     function_context: RefCell<FuncContext>,
     potential_flexible_array_members: RefCell<IndexSet<CDeclId>>,
     macro_expansions: RefCell<IndexMap<CDeclId, Option<MacroExpansion>>>,
+    /// `sym -> is_gpl` for every symbol name found in a file-scope
+    /// `EXPORT_SYMBOL*` asm blob (see `parse_export_symbol_licenses`).
+    /// Built once up front from `ast_context` because the `FileScopeAsm`
+    /// decl carrying a symbol's license string is a sibling top-level decl,
+    /// not something reachable from the `Function` decl itself — see the
+    /// `KernelIdiomRule::ExportSymbol` doc comment in `kernel_idioms.rs`
+    /// for why this string is the only place the GPL/non-GPL distinction
+    /// survives preprocessing.
+    export_symbol_licenses: IndexMap<String, bool>,
     /// Sets of imports deferred while translating nested expressions for caching. Imports are
     /// deferred when caching translations to make them pure and thus cache the translation
     /// alongside its required imports. Each additional nested level of caching translation
@@ -391,6 +401,54 @@ fn attr_unsafety(edition: RustEdition) -> Unsafety {
     } else {
         Unsafety::Normal
     }
+}
+
+/// Scan every top-level `FileScopeAsm` decl in `ast_context` for the asm
+/// text that `EXPORT_SYMBOL`/`EXPORT_SYMBOL_GPL`/etc. expand to
+/// (`include/linux/export.h`'s `___EXPORT_SYMBOL`), and return `sym ->
+/// is_gpl` for every symbol found.
+///
+/// The license distinction (plain `EXPORT_SYMBOL` vs `EXPORT_SYMBOL_GPL`)
+/// is erased from the `FunctionDecl` itself by preprocessing — neither
+/// macro attaches any Clang attribute to the function (see the
+/// `KernelIdiomRule::ExportSymbol` doc comment for the full trace). It
+/// survives only as the license-string literal inside a sibling top-level
+/// `asm(...)` statement:
+///
+/// ```text
+/// asm(".section \".export_symbol\",\"a\" ; __export_symbol_SYM: ; \
+///      .asciz \"LICENSE\" ; .ascii \"NS\" \"\\0\" ; .balign 8 ; \
+///      .quad SYM ; .previous");
+/// ```
+///
+/// with `LICENSE` being `GPL` for `_GPL` variants and empty for plain
+/// `EXPORT_SYMBOL`. `c2rust-ast-exporter` already exports the full text of
+/// this asm statement verbatim as `CDeclKind::FileScopeAsm { asm_string }`
+/// (added for issue #13, to stop dropping the node entirely) — this reads
+/// that same string back out, keyed by the `__export_symbol_<sym>` label,
+/// rather than needing any exporter-side change.
+fn parse_export_symbol_licenses(ast_context: &TypedAstContext) -> IndexMap<String, bool> {
+    // Matches the `__export_symbol_<sym>:` label together with the
+    // `.asciz "<license>"` that immediately follows it (the fixed order
+    // `___EXPORT_SYMBOL` always emits). `(?s)` lets `.` cross the escaped
+    // `\n`-free but otherwise free-form whitespace GCC/LLVM's asm string
+    // may contain between statements.
+    let re = Regex::new(
+        r#"(?s)__export_symbol_([A-Za-z_][A-Za-z0-9_]*)\s*:.*?\.asciz\s*"((?:[^"\\]|\\.)*)""#,
+    )
+    .expect("export-symbol asm regex is a fixed valid pattern");
+
+    let mut licenses = IndexMap::new();
+    for (_, decl) in ast_context.iter_decls() {
+        if let CDeclKind::FileScopeAsm { ref asm_string } = decl.kind {
+            for caps in re.captures_iter(asm_string) {
+                let sym = caps[1].to_string();
+                let is_gpl = &caps[2] == "GPL";
+                licenses.insert(sym, is_gpl);
+            }
+        }
+    }
+    licenses
 }
 
 /// Generate link attributes needed to ensure that the generated Rust libraries have the right symbol values.
@@ -1661,6 +1719,7 @@ impl<'c> Translation<'c> {
             .find_file_id(main_file)
             .expect("could not find FileId for main file");
         let items = indexmap! {main_file => ItemStore::new()};
+        let export_symbol_licenses = parse_export_symbol_licenses(&ast_context);
 
         Translation {
             features: RefCell::new(IndexSet::new()),
@@ -1673,6 +1732,7 @@ impl<'c> Translation<'c> {
             function_context: RefCell::new(FuncContext::new()),
             potential_flexible_array_members: RefCell::new(IndexSet::new()),
             macro_expansions: RefCell::new(IndexMap::new()),
+            export_symbol_licenses,
             deferred_imports: RefCell::new(Vec::new()),
             cleanup_guard_emitted: Cell::new(false),
             comment_context,
@@ -1693,6 +1753,15 @@ impl<'c> Translation<'c> {
 
     pub fn cur_file(&self) -> FileId {
         self.cur_file.get().unwrap_or(self.main_file)
+    }
+
+    /// Whether `name` (the C, un-renamed identifier) was exported via
+    /// `EXPORT_SYMBOL_GPL`/`EXPORT_SYMBOL_GPL_FOR_MODULES`/etc. — i.e. is
+    /// present in `export_symbol_licenses` with a GPL license string. Only
+    /// this — never a plain non-GPL `EXPORT_SYMBOL` — is eligible for
+    /// `#[export]`; see `KernelIdiomRule::ExportSymbol`'s doc comment.
+    fn is_gpl_export_symbol(&self, name: &str) -> bool {
+        self.export_symbol_licenses.get(name).copied() == Some(true)
     }
 
     fn with_cur_file_item_store<F, T>(&self, f: F) -> T

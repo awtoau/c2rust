@@ -294,9 +294,38 @@ impl<'c> Translation<'c> {
                     // but strings have to do for now
                     self.mk_cross_check(mk(), vec!["entry(djb2=\"main\")", "exit(djb2=\"main\")"])
                 } else if (is_global && !is_inline) || is_extern_inline {
-                    mk_linkage(false, new_name, name, self.tcfg.edition)
-                        .extern_("C")
-                        .pub_()
+                    // A function that would otherwise get a plain
+                    // `#[no_mangle]` (i.e. the renamer left its name
+                    // unchanged — same condition `mk_linkage` itself uses
+                    // to choose the `no_mangle` vs `export_name` branch)
+                    // gets the kernel's signature-checked `#[export]`
+                    // attribute instead, but ONLY when the C original was
+                    // `EXPORT_SYMBOL_GPL`/etc: `#[export]` unconditionally
+                    // emits `EXPORT_SYMBOL_GPL` semantics
+                    // (`rust/macros/export.rs` has no non-GPL variant), so
+                    // applying it to a plain-`EXPORT_SYMBOL` (non-GPL)
+                    // original would silently tighten that export's
+                    // license — see `KernelIdiomRule::ExportSymbol`.
+                    if new_name == name
+                        && self
+                            .tcfg
+                            .kernel_idiom_rules
+                            .is_enabled(crate::KernelIdiomRule::ExportSymbol)
+                        && self.is_gpl_export_symbol(name)
+                    {
+                        self.with_cur_file_item_store(|item_store| {
+                            item_store.add_use(true, vec!["macros".into()], "export");
+                        });
+                        mk().unsafety(attr_unsafety(self.tcfg.edition))
+                            .single_attr("export")
+                            .unsafety(Unsafety::Normal)
+                            .extern_("C")
+                            .pub_()
+                    } else {
+                        mk_linkage(false, new_name, name, self.tcfg.edition)
+                            .extern_("C")
+                            .pub_()
+                    }
                 } else if self.cur_file.get().is_some() {
                     mk().extern_("C").pub_()
                 } else {
