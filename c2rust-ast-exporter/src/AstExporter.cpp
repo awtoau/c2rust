@@ -2443,10 +2443,27 @@ class TranslateASTVisitor final
         // Unlike struct or union, there are no forward-declared enums in ISO C.
         // They are used in actual code and accepted by compilers, so we cannot
         // exit early via code like `if (!D->isCompleteDefinition()) return true;`.
-
+        //
+        // However, `EnumDecl::enumerators()` returns the enumerator list from
+        // the *canonical/complete* redeclaration regardless of which specific
+        // redeclaration `D` is. If a TU has both a bare `enum foo;` restatement
+        // and the real `enum foo { ... };` definition (legal, and common in the
+        // kernel: a header forward-declares the tag, another header --
+        // possibly transitively included earlier -- supplies the body), every
+        // redeclaration node would otherwise claim the same enumerators as its
+        // own children. On the Rust side, the last-visited `TagEnumDecl` wins
+        // the `parents` entry for each enumerator, which can leave enumerator
+        // constants parented to a non-defining (`integral_type: None`,
+        // opaque-extern-type) redeclaration instead of the real definition.
+        // Only the node that is itself the complete definition may claim the
+        // enumerators as children; other redeclarations still get their own
+        // (childless) entry so genuinely opaque forward-declare-only enums are
+        // unaffected.
         std::vector<void *> childIds;
-        for (auto x : D->enumerators()) {
-            childIds.push_back(x->getCanonicalDecl());
+        if (D->isCompleteDefinition()) {
+            for (auto x : D->enumerators()) {
+                childIds.push_back(x->getCanonicalDecl());
+            }
         }
 
         auto underlying_type = D->getIntegerType();
