@@ -946,7 +946,8 @@ impl<'c> Translation<'c> {
             .filter(|idx| !referenced_indices.contains(idx))
             .collect();
 
-        self.use_feature("asm");
+        // `core::arch::asm!` needs no feature gate: stable since Rust 1.59
+        // (Feb 2022). See the matching note on `convert_file_scope_asm`.
 
         fn push_expr(tokens: &mut Vec<TokenTree>, expr: Box<Expr>) {
             tokens.extend(expr.to_token_stream());
