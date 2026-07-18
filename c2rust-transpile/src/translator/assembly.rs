@@ -1128,7 +1128,39 @@ impl<'c> Translation<'c> {
             arch,
         )?;
 
-        let rewritten_asm = prolog + &rewritten_asm + &epilog;
+        let mut rewritten_asm = prolog + &rewritten_asm + &epilog;
+
+        // Some surviving operands are never referenced by the template at
+        // all, yet must still be kept (unlike the pure-output case dropped
+        // above) because they carry real dataflow - most commonly a tied
+        // inout compiler-barrier idiom with an empty asm string, e.g.
+        // `include/linux/compiler.h`'s `OPTIMIZER_HIDE_VAR`:
+        // `asm("" : "=r"(var) : "0"(var))`, which relies on the compiler
+        // being *unable* to reason about what happens to `var` even though
+        // no real instruction touches it. Rust's asm! requires every
+        // operand to appear in the template at least once regardless of
+        // its direction ("argument never used" otherwise), so append a
+        // trailing asm-comment line referencing each such operand's index
+        // - exactly the workaround rustc's own diagnostic suggests
+        // ("consider using it in an asm comment"). Comments are stripped
+        // before assembly, so this cannot change the emitted instructions;
+        // it only keeps the operand "live" for Rust's own bookkeeping,
+        // which is exactly what the original GCC/Clang asm relied on too.
+        let mut has_comment_only_operand = false;
+        for (new_idx, operand) in args.iter().enumerate() {
+            let referenced = operand
+                .out_expr
+                .map(|(idx, _)| referenced_indices.contains(&idx))
+                .unwrap_or(false)
+                || operand
+                    .in_expr
+                    .map(|(idx, _)| referenced_indices.contains(&idx))
+                    .unwrap_or(false);
+            if !referenced {
+                rewritten_asm.push_str(&format!("/* {{{new_idx}}} */\n"));
+                has_comment_only_operand = true;
+            }
+        }
 
         // Emit assembly template
         for line in rewritten_asm.split('\n') {
@@ -1339,7 +1371,25 @@ impl<'c> Translation<'c> {
                 // clobbers are emitted as their own `out(reg) _` operands
                 // above (not part of `args`/`has_real_output`), so they
                 // also count as a real output for this purpose.
-                if read_only && (has_real_output || emitted_register_clobbers > 0) {
+                //
+                // A statement with a comment-only operand (see
+                // `has_comment_only_operand` above) is excluded outright,
+                // regardless of read_only/output count: these are
+                // compiler-barrier idioms (e.g. OPTIMIZER_HIDE_VAR, used by
+                // nospec.h's array_index_mask_nospec for Spectre-v1
+                // mitigation) whose entire purpose is to stop the compiler
+                // reasoning about the operand's dataflow. `pure` explicitly
+                // licenses the compiler to assume outputs are a function of
+                // inputs and reorder/CSE/eliminate accordingly - exactly
+                // the assumption these barriers exist to block. Applying it
+                // here wouldn't fail to compile; it would silently defeat
+                // the barrier, which for a speculation-mitigation call site
+                // is a security-relevant correctness bug, not just a
+                // performance quirk.
+                if read_only
+                    && !has_comment_only_operand
+                    && (has_real_output || emitted_register_clobbers > 0)
+                {
                     options.push(mk().ident_expr("pure"));
                     options.push(mk().ident_expr("readonly"));
                 }
