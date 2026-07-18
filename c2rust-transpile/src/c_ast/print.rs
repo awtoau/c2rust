@@ -675,6 +675,11 @@ impl<W: Write> Printer<W> {
 
             StaticAssert { .. } => {
                 self.writer.write_fmt(format_args!("static_assert(...)"))?;
+            }
+
+            FileScopeAsm { ref asm_string } => {
+                self.writer
+                    .write_fmt(format_args!("asm({:?})", asm_string))?;
             } // _ => unimplemented!("Printer::print_decl"),
         };
 

@@ -1201,6 +1201,26 @@ class TranslateASTVisitor final
         return true;
     }
 
+    // A top-level `asm(...)` statement outside any function, e.g. the asm
+    // string that `EXPORT_SYMBOL`/`EXPORT_SYMBOL_GPL`/etc. expand to
+    // (`include/linux/export.h`). Unlike `GCCAsmStmt` (inline asm inside a
+    // function body, see `VisitGCCAsmStmt` above), file-scope GCC asm has no
+    // input/output/clobber operand list to extract - it's a bare string, so
+    // this only needs the asm text itself. Without this override, the base
+    // `RecursiveASTVisitor` still walks into `FileScopeAsmDecl` (so nothing
+    // crashes) but never calls `encode_entry` for it, which desyncs the
+    // `ast_nodes` map from the separate `top_nodes` list built in
+    // `HandleTranslationUnit` and drops the whole translation unit with a
+    // "Missing top-level node" warning (see linux-rs c2rust#13).
+    bool VisitFileScopeAsmDecl(FileScopeAsmDecl *FSAD) {
+        std::vector<void *> childIds;
+        encode_entry(FSAD, TagFileScopeAsmDecl, childIds, QualType(),
+                     [FSAD](CborEncoder *array) {
+                         cbor_encode_string(array, FSAD->getAsmString());
+                     }); // 4th argument (QualType) unused
+        return true;
+    }
+
     bool VisitLabelStmt(LabelStmt *LS) {
 
         std::vector<void *> childIds = {LS->getSubStmt()};
