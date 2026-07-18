@@ -1,9 +1,18 @@
 [workspace]
 resolver = "2"
+# Trimmed to only what this project's own tooling actually invokes
+# (scripts/run_c2rust_baseline.py, scripts/investigate_c2rust_failure.py
+# only ever call `c2rust transpile`) -- confirmed via grep, 2026-07-18,
+# zero references anywhere to refactor/analyze/pdg/instrument. Excluded
+# crates (c2rust-analyze, c2rust-refactor, dynamic_instrumentation, pdg)
+# have no dependency FROM c2rust/c2rust-transpile/c2rust-ast-exporter
+# (confirmed via grep of their Cargo.toml files), so removing them from
+# the workspace doesn't change the transpile path at all -- only build
+# time and repo footprint (~6.5MB of source, plus their own dependency
+# trees, no longer built by a plain `cargo build --release`).
 members = [
     "analysis/runtime",
     "c2rust",
-    "c2rust-analyze",
     "c2rust-asm-casts",
     "c2rust-ast-builder",
     "c2rust-ast-exporter",
@@ -12,15 +21,16 @@ members = [
     "c2rust-bitfields-derive",
     "c2rust-build-paths",
     "c2rust-macros",
-    "c2rust-refactor",
     "c2rust-rust-tools",
     "c2rust-transpile",
-    "dynamic_instrumentation",
-    "pdg",
 ]
 exclude = [
     "analysis/tests",
+    "c2rust-analyze",
+    "c2rust-refactor",
+    "dynamic_instrumentation",
     "examples",
+    "pdg",
     "tests",
     "tools",
 ]
