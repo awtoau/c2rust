@@ -77,21 +77,50 @@ impl<'c> Translation<'c> {
         );
 
         converted_function.or_else(|e| match self.tcfg.replace_unsupported_decls {
-            ReplaceMode::Extern if body.is_none() => self.convert_function_inner(
-                ctx,
-                span,
-                is_global,
-                false,
-                is_main,
-                is_variadic,
-                is_extern,
-                new_name,
-                name,
-                &args,
-                ret,
-                None,
-                attrs,
-            ),
+            // `body.is_none()` originally covered only functions that never
+            // had a body to begin with (e.g. a prototype whose parameter
+            // type failed to convert) - retrying with `body: None` there is
+            // a no-op-shaped fallback that just re-attempts the same
+            // declaration-only path.
+            //
+            // Also take this path when a body *was* present but failed to
+            // convert (e.g. `Cannot translate GNU asm goto ...`, see
+            // `assembly.rs`'s `convert_asm`): dropping the whole decl in
+            // that case, as happened before this arm existed, leaves every
+            // other declaration in the file that calls this function with a
+            // dangling reference to a symbol that was never declared at
+            // all - not a translation gap callers can spot by inspection,
+            // but a hard compile error one file-scope decl away from the
+            // real problem. Falling back to an `extern "C"` declaration
+            // instead keeps that call site type-checking (same as any other
+            // genuinely-external C symbol c2rust doesn't have a definition
+            // for) and confines the actual information loss to precisely
+            // the one function whose body failed, which is what the
+            // existing "containing function is skipped with a warning"
+            // comment on the asm-goto check already claims happens.
+            ReplaceMode::Extern => {
+                if body.is_some() {
+                    log::warn!(
+                        "Falling back to an extern declaration for '{}': body failed to translate: {}",
+                        name, e
+                    );
+                }
+                self.convert_function_inner(
+                    ctx,
+                    span,
+                    is_global,
+                    false,
+                    is_main,
+                    is_variadic,
+                    is_extern,
+                    new_name,
+                    name,
+                    &args,
+                    ret,
+                    None,
+                    attrs,
+                )
+            }
             _ => Err(e),
         })
     }
