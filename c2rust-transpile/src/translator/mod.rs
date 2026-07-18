@@ -3979,7 +3979,7 @@ impl<'c> Translation<'c> {
             .or_default()
             .add_use(true, vec!["kernel".into()], "warn_on");
 
-        self.convert_expr(ctx.used(), condition_id, None)?
+        self.convert_condition(ctx.used(), true, condition_id)?
             .and_then_try(|condition| {
                 use syn::__private::ToTokens;
                 let tokens = condition.to_token_stream();
