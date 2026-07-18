@@ -70,6 +70,24 @@ pub enum KernelIdiomRule {
     /// it) — this preserves the call shape at each `_THIS_IP_` use site
     /// without reimplementing lockdep's own tracking.
     AddrLabelPlaceholder,
+
+    /// Recognize a function whose C original is wrapped in the kernel's
+    /// `EXPORT_SYMBOL_GPL`/`EXPORT_SYMBOL_GPL_FOR_MODULES`/etc. family (any
+    /// `_EXPORT_SYMBOL(sym, "GPL", ...)` expansion — matched by parsing the
+    /// license string literal out of the file-scope `asm(...)` statement
+    /// each `EXPORT_SYMBOL*` macro expands to, since that's the only place
+    /// the license survives preprocessing; see `export_symbol_licenses` in
+    /// `translator/mod.rs`) and emit `#[export]` (the kernel `rust/macros`
+    /// signature-checked export attribute) instead of a plain `#[no_mangle]`.
+    ///
+    /// Deliberately conservative: a C original using plain `EXPORT_SYMBOL`
+    /// (non-GPL) is left as `#[no_mangle]` rather than promoted to
+    /// `#[export]`, because `#[export]` unconditionally emits
+    /// `EXPORT_SYMBOL_GPL` semantics (`rust/macros/export.rs` has no
+    /// non-GPL variant) — emitting it for a non-GPL original would silently
+    /// tighten that export's license. Matches the policy documented in
+    /// linux-rs's `rulesdb/rules/0001-export-symbol-gpl.toml`.
+    ExportSymbol,
 }
 
 /// The active set of [`KernelIdiomRule`]s for one transpile run.
@@ -104,6 +122,7 @@ pub fn all_named_rules() -> &'static [KernelIdiomRule] {
         KernelIdiomRule::FlsFamily,
         KernelIdiomRule::SwapMemSwap,
         KernelIdiomRule::AddrLabelPlaceholder,
+        KernelIdiomRule::ExportSymbol,
     ]
 }
 
