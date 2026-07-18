@@ -143,51 +143,82 @@ fn parse_constraints(
     // Handle register names
     let constraints = constraints.replace(['{', '}'], "\"");
     let mut llvm_constraints = constraints.clone();
-    let mut constraints = constraints.as_str();
+    let constraints = constraints.as_str();
 
-    // Convert (simple) constraints to ones rustc understands
-    while !constraints.is_empty() {
-        let (c, rest) = constraints.split_at(1);
-        let c = c.chars().next().unwrap();
-        match c {
-            'm' => {
-                mem_only = true;
-                llvm_constraints = "reg".into();
-            }
-            'r' => {
-                llvm_constraints = "reg".into();
-            }
-            'i' => {
-                // Rust inline assembly has no constraint for that, but uses the argument as an
-                // immediate value anyway
-                llvm_constraints = "reg".into();
-            }
-            _ => {
-                let is_explicit_reg = c == '"';
-                let is_tied = !constraints.contains(|c: char| !c.is_ascii_digit());
+    // GCC/Clang extended-asm constraint strings can list multiple
+    // alternative letters for a single operand (e.g. RISC-V's "rK" means
+    // "either any general register, or a 5-bit unsigned immediate", and
+    // the kernel also has the reverse order "Jr"). The compiler is free to
+    // pick whichever alternative it can satisfy for a given argument, and
+    // `r` (and, similarly, `m`/`i`) is always satisfiable regardless of
+    // argument order. So: scan the whole constraint string up front for
+    // one of these arch-generic letters and prefer it outright, rather
+    // than resolving letters left-to-right and letting a later, more
+    // restrictive letter (e.g. a machine constraint that only applies to
+    // compile-time-constant operands, like RISC-V's I/J/K) overwrite an
+    // already-valid mapping - or get chosen first and reject an operand
+    // that a plain register would have handled fine. This is what fixes a
+    // real bug where `"rK"` used to resolve to `"reg"` on the `r`
+    // alternative, then a left-to-right loop continued into `K` and
+    // clobbered that with a passthrough of the raw, un-mapped GCC letter
+    // (see translate_machine_constraint's Riscv arm below).
+    if constraints.is_empty() {
+        // Nothing to translate (matches prior behavior: an empty
+        // constraint string is left as-is rather than treated as an
+        // error).
+    } else if let Some(generic) = constraints.chars().find(|c| matches!(c, 'm' | 'r' | 'i')) {
+        if generic == 'm' {
+            mem_only = true;
+        }
+        // For 'i', Rust inline assembly has no constraint for that, but
+        // uses the argument as a register-held value anyway.
+        llvm_constraints = "reg".into();
+    } else {
+        // No arch-generic fallback letter is present; the whole
+        // constraint string must be a single register name/index or a
+        // machine-specific constraint.
+        let is_explicit_reg = constraints.starts_with('"');
+        let is_tied = !constraints.contains(|c: char| !c.is_ascii_digit());
 
-                if !(is_explicit_reg || is_tied) {
-                    // Attempt to parse machine-specific constraints
-                    if let Some((machine_constraints, is_mem)) =
-                        translate_machine_constraint(constraints, arch)
-                    {
-                        llvm_constraints = machine_constraints.into();
-                        mem_only = is_mem;
-                    } else {
-                        warn!(
-                            "Did not recognize inline asm constraint: {}\n\
-                            It is likely that this will cause compilation errors or \
-                            incorrect semantics in the translated program; please \
-                            manually correct.",
-                            constraints
-                        );
-                        llvm_constraints = constraints.into();
-                    }
-                }
-                break;
+        if !(is_explicit_reg || is_tied) {
+            // Attempt to parse machine-specific constraints
+            if let Some((machine_constraints, is_mem)) =
+                translate_machine_constraint(constraints, arch)
+            {
+                llvm_constraints = machine_constraints.into();
+                mem_only = is_mem;
+            } else {
+                // Refuse to guess: passing the raw GCC/LLVM constraint
+                // letter through as a Rust register-class name either
+                // fails to compile (the common case - Rust rejects
+                // unknown register classes outright) or, worse, could
+                // coincide with a real Rust register-class/register name
+                // and silently compile with the wrong operand handling.
+                // Per this translator's "no output rather than wrong
+                // output" policy for cases it cannot safely translate,
+                // fail the whole statement with a clear error instead;
+                // the caller (convert_asm) already propagates this as a
+                // translation error for just the containing asm
+                // statement, degrading gracefully rather than emitting
+                // assembly whose semantics were never actually verified.
+                warn!(
+                    "Did not recognize inline asm constraint: {}\n\
+                    This constraint has no known, safe translation to a Rust \
+                    asm! register class or operand kind; the containing \
+                    statement will be translated as an error instead of \
+                    emitting output that may silently misbehave.",
+                    constraints
+                );
+                return Err(TranslationError::new(
+                    None,
+                    failure::err_msg(format!(
+                        "Inline assembly constraint '{constraints}' has no known \
+                         translation to a Rust asm! operand kind for this target"
+                    ))
+                    .context(TranslationErrorKind::Generic),
+                ));
             }
         }
-        constraints = rest;
     }
 
     let mode = if mem_only {
@@ -288,6 +319,40 @@ fn translate_machine_constraint(constraint: &str, arch: Arch) -> Option<(&str, b
         },
         Arch::Riscv => match constraint {
             "f" => "freg",
+            // "A": "an address that is held in a general-purpose register"
+            // (GCC RISC-V machine constraints, config/riscv/constraints.md).
+            // This is used on the memory operand of AMO (atomic memory
+            // operation) instructions like `amoand.d`/`amoswap.d`/`lr.w`,
+            // where the asm template dereferences the operand directly
+            // (`amoand.d zero, {1}, {0}` etc. with no offset/indexing), so
+            // it maps to a plain GPR used as a memory address, i.e. Rust's
+            // `reg` register class with the mem-only (address-of) handling
+            // that `parse_constraints`'s caller applies via `is_mem`.
+            "A" => {
+                *mem = true;
+                "reg"
+            }
+            // "I"/"J"/"K" are pure immediate-value constraints (12-bit
+            // signed immediate / integer zero / 5-bit unsigned CSR
+            // immediate, respectively) with no register-class meaning at
+            // all: GCC only ever uses them as one alternative in a
+            // multi-letter constraint string (typically "rI"/"rJ"/"rK"),
+            // where the other alternative, "r" (any GPR), is always a
+            // valid fallback and is what `parse_constraints` now resolves
+            // to before this function is ever reached for those cases (see
+            // the early `break` on the 'r' arm above). If we get here with
+            // a *lone* immediate-only letter, the operand's value is a
+            // compile-time-unknown expression from the translator's point
+            // of view, and Rust's `asm!` immediates (`const` operands)
+            // require operands to be actual compile-time constants - not
+            // just "was a constant when GCC compiled the original C". There
+            // is no way to soundly force that here, so refuse to guess and
+            // let the caller fall through to its existing
+            // recognize-failure path, which raises a clear translation
+            // error for the containing statement instead of emitting an
+            // asm! that either fails to build or silently mis-encodes the
+            // operand.
+            "I" | "J" | "K" => return None,
             _ => return None,
         },
     };
@@ -602,6 +667,63 @@ fn references_operand_at_or_beyond(asm: &str, min_idx: usize) -> bool {
     false
 }
 
+/// Scan an (LLVM-syntax, `$`-escaped) asm template and collect every
+/// operand index it references (`$N`, `$xN`, or `${N:mod}` forms).
+///
+/// GCC/Clang extended asm tolerates declaring an output operand that no
+/// `%N` (here, already-lowered to `$N`) in the template ever writes to -
+/// GCC simply never emits code touching that operand, silently treating it
+/// as a no-op (seen in the kernel's own `arch/riscv/include/asm/vector.h`
+/// `__vstate_csr_save`, which declares 4 outputs but only references 3).
+/// Rust's `asm!` has no equivalent tolerance and rejects any operand that
+/// isn't referenced by the template outright ("argument never used"). This
+/// is used to find such unreferenced output operands so they can be
+/// rendered as discarded (`_`) rather than bound to the real output
+/// expression - since the instruction sequence never actually writes to
+/// that operand, `_` (an arbitrary scratch register, value discarded)
+/// preserves the original (odd, but real) semantics of "this operand is
+/// declared but never actually written," rather than either failing to
+/// compile or, if we invented a fake reference just to satisfy rustc,
+/// writing a bogus value into the caller's variable.
+fn referenced_operand_indices(asm: &str) -> std::collections::HashSet<usize> {
+    let mut indices = std::collections::HashSet::new();
+    let mut first = true;
+    let mut last_empty = false;
+    for chunk in asm.split('$') {
+        if first {
+            first = false;
+            continue;
+        }
+        if last_empty {
+            last_empty = false;
+            continue;
+        }
+        if chunk.is_empty() {
+            last_empty = true;
+            continue;
+        }
+
+        let digits: String = if let Some(rest) = chunk.strip_prefix('{') {
+            rest.chars()
+                .skip_while(|c| !c.is_ascii_digit())
+                .take_while(|c| c.is_ascii_digit())
+                .collect()
+        } else {
+            let rest = if chunk.starts_with(|c: char| c.is_ascii_alphabetic()) {
+                &chunk[1..]
+            } else {
+                chunk
+            };
+            rest.chars().take_while(|c| c.is_ascii_digit()).collect()
+        };
+
+        if let Ok(idx) = digits.parse::<usize>() {
+            indices.insert(idx);
+        }
+    }
+    indices
+}
+
 /// Rewrite a LLVM inline assembly template string into an asm!-compatible one
 /// by translating its references to operands (of the form $0 or $x0) to {0} or
 /// {0:y} (and wrapping mem-only references in square brackets).
@@ -793,6 +915,16 @@ impl<'c> Translation<'c> {
             ));
         }
 
+        // Find output operands that the template never actually
+        // substitutes (see `referenced_operand_indices`'s doc comment).
+        // These get bound to `_` (discarded) below rather than to the
+        // real output expression, since GCC's own behavior for these is
+        // to silently never write to them.
+        let referenced_indices = referenced_operand_indices(asm);
+        let unreferenced_outputs: std::collections::HashSet<usize> = (0..outputs.len())
+            .filter(|idx| !referenced_indices.contains(idx))
+            .collect();
+
         self.use_feature("asm");
 
         fn push_expr(tokens: &mut Vec<TokenTree>, expr: Box<Expr>) {
@@ -850,48 +982,65 @@ impl<'c> Translation<'c> {
         let mut args = Vec::new();
 
         // Add outputs as inout if a matching input is found, else as outputs
+        //
+        // A constraint that fails to parse (e.g. a machine constraint with
+        // no safe Rust asm! translation) used to be silently dropped here,
+        // logging to stderr but otherwise proceeding to emit an asm!
+        // invocation missing that operand entirely - which either leaves a
+        // dangling `{N}` reference in the template (a confusing, unrelated
+        // compile error) or, worse, silently shifts every subsequent
+        // operand's index, changing which value each `{N}` in the template
+        // actually binds to. That silent-corruption risk is exactly what
+        // this translator's operand handling must not do, so propagate the
+        // error and fail the whole statement instead: the caller degrades
+        // this to a translation error for just the containing function,
+        // per the project's "no output rather than wrong output" pattern.
         for (output_idx, output) in outputs.iter().enumerate() {
-            match parse_constraints(&output.constraints, arch) {
-                Ok((mut dir_spec, mem_only, parsed)) => {
-                    // Add to args list; if a matching in_expr is found, this is
-                    // an inout and we remove the output from the outputs list
-                    let mut in_expr = inputs_by_register.remove(&parsed);
-                    if in_expr.is_none() {
-                        // Also check for by-index references to this output
-                        in_expr = inputs_by_register.remove(&output_idx.to_string());
-                    }
-                    // Extract expression
-                    let in_expr = in_expr.map(|(i, operand)| (i, operand.expression));
-
-                    // For inouts, change the dirspec to include 'in'
-                    if in_expr.is_some() {
-                        dir_spec = dir_spec.with_in();
-                    }
-                    args.push(BidirAsmOperand {
-                        dir_spec,
-                        mem_only,
-                        name: None,
-                        constraints: parsed,
-                        in_expr,
-                        out_expr: Some((output_idx, output.expression)),
-                    });
-                }
-                // Constraint could not be parsed, drop it
-                Err(e) => eprintln!("{}", e),
+            let (mut dir_spec, mem_only, parsed) = parse_constraints(&output.constraints, arch)?;
+            // Add to args list; if a matching in_expr is found, this is
+            // an inout and we remove the output from the outputs list
+            let mut in_expr = inputs_by_register.remove(&parsed);
+            if in_expr.is_none() {
+                // Also check for by-index references to this output
+                in_expr = inputs_by_register.remove(&output_idx.to_string());
             }
+            // Extract expression
+            let in_expr = in_expr.map(|(i, operand)| (i, operand.expression));
+
+            // Drop pure-output operands (no tied input) that the asm
+            // template never actually references (see
+            // `referenced_operand_indices`). An inout/tied operand is never
+            // dropped here even if unreferenced under its *output* index,
+            // because the corresponding input still needs to be wired in;
+            // that case is instead caught by the same
+            // `unreferenced_outputs` check re-applied to its (renumbered)
+            // combined index further below, via `new_idx_for_orig` still
+            // finding this operand - the only thing we can safely skip
+            // without losing real dataflow is a standalone, wholly-unused
+            // output.
+            if in_expr.is_none() && unreferenced_outputs.contains(&output_idx) {
+                continue;
+            }
+
+            // For inouts, change the dirspec to include 'in'
+            if in_expr.is_some() {
+                dir_spec = dir_spec.with_in();
+            }
+            args.push(BidirAsmOperand {
+                dir_spec,
+                mem_only,
+                name: None,
+                constraints: parsed,
+                in_expr,
+                out_expr: Some((output_idx, output.expression)),
+            });
         }
         // Add unmatched inputs
         for (_, (input_idx, input)) in inputs_by_register
             .into_iter()
             .chain(other_inputs.into_iter())
         {
-            let (dir_spec, mem_only, parsed) = match parse_constraints(&input.constraints, arch) {
-                Ok(x) => x,
-                Err(e) => {
-                    eprintln!("{}", e);
-                    continue;
-                }
-            };
+            let (dir_spec, mem_only, parsed) = parse_constraints(&input.constraints, arch)?;
             args.push(BidirAsmOperand {
                 dir_spec,
                 mem_only,
@@ -966,6 +1115,22 @@ impl<'c> Translation<'c> {
             tokens.push(TokenTree::Punct(Punct::new(',', Alone)));
         }
         tokens.pop();
+
+        // Whether any operand actually being emitted writes to something
+        // (`out`/`lateout`/`inout`/`inlateout`). Rust's `asm!` requires the
+        // `pure` option to have at least one real output. Counting on
+        // `outputs.len()` (the raw GNU AST output count) instead is not
+        // equivalent: a `+`/mem-only-constrained operand can resolve to a
+        // plain `In` direction (see `parse_constraints`'s mode selection),
+        // and an unreferenced pure-output operand may have just been
+        // dropped from `args` entirely above - both cases leave `args`
+        // with zero real outputs despite `outputs.len() > 0`, which used
+        // to let `pure` be emitted on an asm! with no actual output,
+        // hard-rejected by rustc (`asm with the 'pure' option must have at
+        // least one output`).
+        let has_real_output = args
+            .iter()
+            .any(|op| !matches!(op.dir_spec, ArgDirSpec::In));
 
         // Outputs and Inputs
         let mut operand_renames = HashMap::new();
@@ -1101,6 +1266,12 @@ impl<'c> Translation<'c> {
 
         let mut preserves_flags = true;
         let mut read_only = true;
+        // Counts only clobbers that actually emit an `out(reg) _` operand
+        // below (unlike `clobbers.len()`, which also counts "cc"/"memory"
+        // pseudo-clobbers and reserved-register clobbers that get dropped
+        // without emitting anything) - this is what actually determines
+        // whether there's a real output operand for the `pure` option.
+        let mut emitted_register_clobbers = 0usize;
 
         // Clobbers
         for clobber in clobbers {
@@ -1133,6 +1304,7 @@ impl<'c> Translation<'c> {
             let result = mk().call_expr(mk().ident_expr("out"), vec![mk().lit_expr(clobber)]);
             push_expr(&mut tokens, result);
             push_expr(&mut tokens, mk().ident_expr("_"));
+            emitted_register_clobbers += 1;
         }
 
         // Options
@@ -1142,8 +1314,11 @@ impl<'c> Translation<'c> {
                 options.push(mk().ident_expr("preserves_flags"));
             }
             if !is_volatile {
-                // Pure cannot be applied if we have no outputs
-                if read_only && (outputs.len() + clobbers.len()) > 0 {
+                // Pure cannot be applied if we have no outputs. Register
+                // clobbers are emitted as their own `out(reg) _` operands
+                // above (not part of `args`/`has_real_output`), so they
+                // also count as a real output for this purpose.
+                if read_only && (has_real_output || emitted_register_clobbers > 0) {
                     options.push(mk().ident_expr("pure"));
                     options.push(mk().ident_expr("readonly"));
                 }
