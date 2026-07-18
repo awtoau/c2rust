@@ -2696,8 +2696,7 @@ impl<'c> Translation<'c> {
                         // pattern already used for synthetic names derived
                         // from possibly-raw field names in structs_unions.rs.
                         let plain_rust_name = rust_name.strip_prefix("r#").unwrap_or(&rust_name);
-                        let guard_ident =
-                            mk().ident(&format!("_cleanup_{}", plain_rust_name));
+                        let guard_ident = mk().ident(&format!("_cleanup_{}", plain_rust_name));
                         syn::parse_quote! {
                             let #guard_ident = CleanupGuard(
                                 &raw mut #var_ident as *mut _,
@@ -3760,6 +3759,156 @@ impl<'c> Translation<'c> {
             None
         }
 
+        fn rewrite_breaks_and_continues(
+            stmts: &mut [Stmt],
+            enclosing_labels: &std::collections::HashSet<String>,
+            target_label: &str,
+        ) {
+            let mut declared_labels = enclosing_labels.clone();
+
+            for stmt in stmts.iter_mut() {
+                match stmt {
+                    Stmt::Expr(Expr::Break(break_expr), _) => {
+                        if let Some(label) = &break_expr.label {
+                            if !declared_labels.contains(&label.ident.to_string()) {
+                                break_expr.label = Some(mk().label(target_label).name);
+                            }
+                        }
+                    }
+                    Stmt::Expr(Expr::Continue(cont_expr), _) => {
+                        if let Some(label) = &cont_expr.label {
+                            if !declared_labels.contains(&label.ident.to_string()) {
+                                cont_expr.label = Some(mk().label(target_label).name);
+                            }
+                        }
+                    }
+                    Stmt::Expr(Expr::Block(block_expr), _) => {
+                        if let Some(ref label) = block_expr.label {
+                            declared_labels.insert(label.name.ident.to_string());
+                        }
+                        rewrite_breaks_and_continues(
+                            &mut block_expr.block.stmts,
+                            &declared_labels,
+                            target_label,
+                        );
+                    }
+                    Stmt::Expr(Expr::Loop(loop_expr), _) => {
+                        if let Some(ref label) = loop_expr.label {
+                            declared_labels.insert(label.name.ident.to_string());
+                        }
+                        rewrite_breaks_and_continues(
+                            &mut loop_expr.body.stmts,
+                            &declared_labels,
+                            target_label,
+                        );
+                    }
+                    Stmt::Expr(Expr::While(while_expr), _) => {
+                        if let Some(ref label) = while_expr.label {
+                            declared_labels.insert(label.name.ident.to_string());
+                        }
+                        rewrite_breaks_and_continues(
+                            &mut while_expr.body.stmts,
+                            &declared_labels,
+                            target_label,
+                        );
+                    }
+                    Stmt::Expr(Expr::If(if_expr), _) => {
+                        rewrite_breaks_and_continues(
+                            &mut if_expr.then_branch.stmts,
+                            &declared_labels,
+                            target_label,
+                        );
+                        if let Some((_, else_expr)) = &mut if_expr.else_branch {
+                            // The `else` arm of a C-derived `if` is either a
+                            // block (`else { .. }`) or, for an `else if`
+                            // chain, another bare `if` expression (not
+                            // wrapped in a block) -- both need their nested
+                            // breaks/continues rewritten. Anything else
+                            // (e.g. a single non-block expression) can't
+                            // contain a labelled break/continue statement,
+                            // so there's nothing to rewrite.
+                            let mut wrapper = vec![Stmt::Expr((**else_expr).clone(), None)];
+                            rewrite_breaks_and_continues(
+                                &mut wrapper,
+                                &declared_labels,
+                                target_label,
+                            );
+                            if let Some(Stmt::Expr(rewritten, _)) = wrapper.into_iter().next() {
+                                **else_expr = rewritten;
+                            }
+                        }
+                    }
+                    Stmt::Expr(Expr::Match(match_expr), _) => {
+                        for arm in match_expr.arms.iter_mut() {
+                            if let Expr::Block(block_expr) = arm.body.as_mut() {
+                                rewrite_breaks_and_continues(
+                                    &mut block_expr.block.stmts,
+                                    &declared_labels,
+                                    target_label,
+                                );
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Whether any break/continue anywhere in `stmts` still targets
+        // `target_ident` (a plain lifetime identifier, no leading `'`).
+        // Needed before treating a tail `break 'lbl <val>;` as this
+        // statement expression's *only* escape to `lbl`
+        // (as_semi_break_stmt's unwrap-to-value-block optimization
+        // below): rewrite_breaks_and_continues can leave more than one
+        // break/continue pointed at the same synthetic label when the
+        // C source had more than one `goto` escaping the statement
+        // expression to different original targets (e.g. wait_event()'s
+        // `___wait_event()` -- a `goto __out;` embedded mid-loop
+        // alongside the CFG's own naturally-injected tail break for the
+        // trailing `__out: __ret;`). Unwrapping on the tail break alone
+        // in that case would strip the only remaining declaration of
+        // `lbl`, leaving the other, earlier break dangling (E0426).
+        fn stmts_reference_label(stmts: &[Stmt], target_ident: &str) -> bool {
+            stmts
+                .iter()
+                .any(|stmt| stmt_references_label(stmt, target_ident))
+        }
+
+        fn stmt_references_label(stmt: &Stmt, target_ident: &str) -> bool {
+            match stmt {
+                Stmt::Expr(Expr::Break(ExprBreak { label: Some(l), .. }), _) => {
+                    l.ident == target_ident
+                }
+                Stmt::Expr(Expr::Continue(cont_expr), _) => cont_expr
+                    .label
+                    .as_ref()
+                    .is_some_and(|l| l.ident == target_ident),
+                Stmt::Expr(Expr::Block(block_expr), _) => {
+                    stmts_reference_label(&block_expr.block.stmts, target_ident)
+                }
+                Stmt::Expr(Expr::Loop(loop_expr), _) => {
+                    stmts_reference_label(&loop_expr.body.stmts, target_ident)
+                }
+                Stmt::Expr(Expr::While(while_expr), _) => {
+                    stmts_reference_label(&while_expr.body.stmts, target_ident)
+                }
+                Stmt::Expr(Expr::If(if_expr), _) => {
+                    stmts_reference_label(&if_expr.then_branch.stmts, target_ident)
+                        || if_expr.else_branch.as_ref().is_some_and(|(_, else_expr)| {
+                            stmt_references_label(
+                                &Stmt::Expr((**else_expr).clone(), None),
+                                target_ident,
+                            )
+                        })
+                }
+                Stmt::Expr(Expr::Match(match_expr), _) => match_expr.arms.iter().any(|arm| {
+                    matches!(arm.body.as_ref(), Expr::Block(block_expr)
+                        if stmts_reference_label(&block_expr.block.stmts, target_ident))
+                }),
+                _ => false,
+            }
+        }
+
         match self.ast_context[compound_stmt_id].kind {
             CStmtKind::Compound(ref substmt_ids) if !substmt_ids.is_empty() => {
                 let n = substmt_ids.len();
@@ -3817,8 +3966,25 @@ impl<'c> Translation<'c> {
                     )?,
                 };
 
+                rewrite_breaks_and_continues(
+                    &mut stmts,
+                    &std::collections::HashSet::new(),
+                    &lbl.pretty_print(),
+                );
+
                 if let Some(stmt) = stmts.pop() {
-                    match as_semi_break_stmt(&stmt, &lbl) {
+                    // Unwrapping a tail `break 'lbl <val>;` into a plain
+                    // value block discards `lbl`'s only declaration --
+                    // only sound when this tail break is the sole
+                    // remaining reference to `lbl`. A second, earlier
+                    // break/continue can also target `lbl` (see
+                    // stmts_reference_label's doc comment), in which
+                    // case `lbl` must still be declared via the normal
+                    // labelled-block path below for that other jump to
+                    // resolve.
+                    let lbl_ident = lbl.pretty_print();
+                    let other_ref_remains = stmts_reference_label(&stmts, &lbl_ident);
+                    match as_semi_break_stmt(&stmt, &lbl).filter(|_| !other_ref_remains) {
                         Some(val) => {
                             let block = mk().block_expr(match val {
                                 Some(val) if ctx.is_used() => WithStmts::new(stmts, val).to_block(),
@@ -3895,11 +4061,7 @@ impl<'c> Translation<'c> {
     /// macro decls. The structural walk after that check exists only to locate
     /// `condition` within the confirmed expansion, not to detect the expansion
     /// itself.
-    fn warn_on_condition(
-        &self,
-        expr_id: CExprId,
-        compound_stmt_id: CStmtId,
-    ) -> Option<CExprId> {
+    fn warn_on_condition(&self, expr_id: CExprId, compound_stmt_id: CStmtId) -> Option<CExprId> {
         if !self
             .tcfg
             .kernel_idiom_rules
