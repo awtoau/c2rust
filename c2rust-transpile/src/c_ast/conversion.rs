@@ -462,6 +462,19 @@ impl ConversionContext {
     ///
     /// This populates the `typed_context` of the `ConversionContext` it is called on.
     fn convert(&mut self, untyped_context: &AstContext) {
+        // `top_nodes` is a `Vec<ClangId>` ordered for the `.iter().rev()`
+        // push loop below, but the `while let ... = self.visit_as.pop()`
+        // loop tests membership in it once per AST node visited (every
+        // expression/statement/sub-decl in the whole translation unit, not
+        // just top-level ones) via `top_nodes.contains(...)`. A `Vec` scan
+        // there is O(top_level_decl_count) per node, so the whole loop is
+        // O(total_ast_nodes * top_level_decl_count) -- quadratic-ish in
+        // practice since header-heavy kernel TUs pull in thousands of
+        // top-level decls. Building this set once up front makes each
+        // membership check O(1) instead.
+        let top_node_set: std::collections::HashSet<ClangId> =
+            untyped_context.top_nodes.iter().copied().collect();
+
         for raw_comment in &untyped_context.comments {
             let comment = Located {
                 loc: Some(raw_comment.loc.into()),
@@ -500,7 +513,7 @@ impl ConversionContext {
             let new_id = self.id_mapper.get_or_create_new(node_id);
 
             // If the node is top-level, add it as such to the new context
-            if untyped_context.top_nodes.contains(&node_id) {
+            if top_node_set.contains(&node_id) {
                 self.typed_context.c_decls_top.push(CDeclId(new_id));
             }
 

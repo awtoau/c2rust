@@ -972,12 +972,29 @@ pub struct PhaseTimings {
     /// Time from just after AST export returns to just before
     /// `transpile_single` returns: typed-AST conversion
     /// (`ConversionContext`), the translator's C-to-Rust conversion, and
-    /// the file write + optional rustfmt pass. Not split further because
-    /// those steps don't cross an FFI boundary the way AST export does —
-    /// they're plain sequential Rust function calls with no natural
-    /// "resource acquisition" seam to time separately without much finer
-    /// (and noisier) instrumentation.
+    /// the file write + optional rustfmt pass. Equal to the sum of
+    /// `typed_ast_s` + `translator_translate_s` + `rustfmt_s` (plus a
+    /// negligible file-write remainder); kept as its own field for
+    /// backward compatibility with anything already reading it.
     pub translate_s: f64,
+    /// Time in `ConversionContext::into_typed_context` — untyped CBOR AST
+    /// to `TypedAstContext`. Distinct from `ast_export_s` (that's Clang's
+    /// own CBOR export, an FFI call); this is pure Rust-side AST
+    /// construction that happens before `translator::translate` is ever
+    /// called.
+    pub typed_ast_s: f64,
+    /// Time inside `translator::translate` itself — the actual C-to-Rust
+    /// conversion logic (issue awtoau/c2rust#3's ~82% "translator module"
+    /// bucket, minus rustfmt, split out here to tell them apart).
+    pub translator_translate_s: f64,
+    /// Time inside the `rustfmt(&output_path).run()` call specifically
+    /// (an external `rustfmt` subprocess invocation), separated from
+    /// `translator_translate_s` so the two can't be conflated the way
+    /// awtoau/c2rust#3 lumped them together as one ~82% bucket.
+    pub rustfmt_s: f64,
+    /// Byte length of the translated Rust source before rustfmt reformats
+    /// it, for correlating phase cost against output size.
+    pub output_bytes: usize,
     /// Total wall-clock for the whole call, timed independently of the
     /// two phases above (not their sum) as a sanity check that no
     /// untimed work sneaks in between/around them.
@@ -1061,6 +1078,7 @@ fn transpile_single(
     }
 
     // Convert this into a typed AST
+    let typed_ast_start = phase_timings.is_some().then(std::time::Instant::now);
     let typed_context = {
         let conv = ConversionContext::new(input_path, &untyped_context);
         if conv.invalid_clang_ast && tcfg.fail_on_error {
@@ -1068,6 +1086,7 @@ fn transpile_single(
         }
         conv.into_typed_context()
     };
+    let typed_ast_s = typed_ast_start.map(|t| t.elapsed().as_secs_f64());
 
     if tcfg.dump_typed_context {
         println!("Clang AST");
@@ -1088,8 +1107,11 @@ fn transpile_single(
         .unwrap_or_default();
 
     // Perform the translation
+    let translator_start = phase_timings.is_some().then(std::time::Instant::now);
     let (translated_string, maybe_decl_map, pragmas, crates) =
         translator::translate(typed_context, tcfg, input_path, &preprocessed_definitions);
+    let translator_translate_s = translator_start.map(|t| t.elapsed().as_secs_f64());
+    let output_bytes = translated_string.len();
 
     if let Some(decl_map) = maybe_decl_map {
         let decl_map_path = output_path.with_extension("c_decls.json");
@@ -1130,17 +1152,34 @@ fn transpile_single(
         ),
     };
 
+    let rustfmt_start = phase_timings.is_some().then(std::time::Instant::now);
     if !tcfg.disable_rustfmt {
         rustfmt(&output_path).edition(tcfg.edition).run();
     }
+    let rustfmt_s = rustfmt_start.map(|t| t.elapsed().as_secs_f64());
 
-    if let (Some(pt), Some(ast_export_s), Some(translate_start), Some(call_start)) = (
+    if let (
+        Some(pt),
+        Some(ast_export_s),
+        Some(typed_ast_s),
+        Some(translator_translate_s),
+        Some(rustfmt_s),
+        Some(translate_start),
+        Some(call_start),
+    ) = (
         phase_timings.as_deref_mut(),
         ast_export_s,
+        typed_ast_s,
+        translator_translate_s,
+        rustfmt_s,
         translate_start,
         call_start,
     ) {
         pt.ast_export_s = ast_export_s;
+        pt.typed_ast_s = typed_ast_s;
+        pt.translator_translate_s = translator_translate_s;
+        pt.rustfmt_s = rustfmt_s;
+        pt.output_bytes = output_bytes;
         pt.translate_s = translate_start.elapsed().as_secs_f64();
         pt.total_s = call_start.elapsed().as_secs_f64();
     }
