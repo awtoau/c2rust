@@ -378,7 +378,28 @@ fn translate_modifier(modifier: char, arch: Arch) -> Option<char> {
             'p' | 'q' => return None,
             _ => modifier,
         },
-        Arch::Riscv => modifier,
+        Arch::Riscv => match modifier {
+            // GCC RISC-V's `%z` modifier means "print the literal `zero`
+            // mnemonic if this operand is the constant 0 (typically
+            // reached via the 'J' alternative of a multi-letter
+            // constraint like 'rJ'/'Jr'), otherwise print the operand's
+            // assigned register normally." `parse_constraints` always
+            // resolves such multi-letter constraints to the 'r' (any
+            // GPR) alternative (see its handling of arch-generic
+            // fallback letters) rather than ever emitting the immediate
+            // encoding that would make an operand actually become the
+            // `zero` register, so by the time a Rust `asm!` operand
+            // reaches this point it is unconditionally a real, allocated
+            // GPR - the "print `zero`" case can never apply, and the
+            // "print the register normally" case is exactly what Rust's
+            // `{N}` substitution already does with no modifier at all.
+            // Rust's `reg` register class also does not support *any*
+            // template modifier (rustc hard-errors on one), so the
+            // correct translation is to drop `z` rather than pass it
+            // through unchanged.
+            'z' => return None,
+            _ => modifier,
+        },
     })
 }
 
