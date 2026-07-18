@@ -1223,6 +1223,16 @@ impl TypedAstContext {
                 } => true,
                 Variable { ref attrs, .. } | Function { ref attrs, .. }
                     if attrs.contains(&Attribute::Used) => true,
+                // File-scope asm (`CDeclKind::FileScopeAsm`, from Clang's
+                // `FileScopeAsmDecl`) is never referenced by anything else in
+                // the translation unit - like C, it exists purely for its
+                // side effect on the assembled object (e.g. `EXPORT_SYMBOL`'s
+                // symbol-table/versioning entries). The liveness walk below
+                // only reaches a decl by following a reference *to* it, so
+                // without this arm every file-scope asm decl would always
+                // read as unreferenced dead code and get pruned here,
+                // regardless of `needs_export` in `translator/mod.rs`.
+                FileScopeAsm { .. } => true,
                 _ => false,
             };
 
@@ -1779,6 +1789,14 @@ pub enum CDeclKind {
         assert_expr: CExprId,
         message: Option<String>,
     },
+
+    /// A top-level `asm(...)` statement outside any function
+    /// (`FileScopeAsmDecl` in Clang's AST), e.g. the asm string that the
+    /// `EXPORT_SYMBOL`/`EXPORT_SYMBOL_GPL`/etc. macro family expands to.
+    /// Unlike `CStmtKind::Asm` (inline asm inside a function body), this has
+    /// no input/output/clobber operand list - it's translated as a bare
+    /// string, so only the raw asm text is carried.
+    FileScopeAsm { asm_string: String },
 }
 
 impl CDeclKind {

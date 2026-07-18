@@ -1039,6 +1039,7 @@ pub fn translate(
                     Variable { .. } => true,
                     MacroObject { .. } => true, // Depends on `tcfg.translate_const_macros`, but handled in `fn convert_const_macro_expansion`.
                     MacroFunction { .. } => true, // Depends on `tcfg.translate_fn_macros`, but handled in `fn convert_fn_macro_invocation`.
+                    FileScopeAsm { .. } => true,
                     _ => false,
                 };
                 if !needs_export {
@@ -2337,7 +2338,47 @@ impl<'c> Translation<'c> {
                 warn!("ignoring static assert during translation");
                 Ok(ConvertedDecl::NoItem)
             }
+
+            FileScopeAsm { ref asm_string } => self.convert_file_scope_asm(span, asm_string),
         }
+    }
+
+    /// Translate a top-level `asm(...)` statement (`CDeclKind::FileScopeAsm`,
+    /// from Clang's `FileScopeAsmDecl`) into a `core::arch::global_asm!(...)`
+    /// item. This is a purely textual carry-over of the asm string: unlike
+    /// `convert_asm` (inline asm inside a function body), file-scope GCC asm
+    /// has no input/output/clobber operand list to translate, and Rust's
+    /// `global_asm!` (stable since the same release as `asm!`, 1.59) is the
+    /// direct module-scope equivalent in both languages. Preserving the raw
+    /// text (rather than e.g. dropping it) matters here because in this
+    /// kernel corpus file-scope asm is overwhelmingly `EXPORT_SYMBOL`'s
+    /// expansion, which carries real symbol-versioning/namespace metadata
+    /// used by the module loader - exactly the kind of thing a
+    /// correctness-conscious reviewer of the transpiled output needs to see,
+    /// not have silently discarded.
+    fn convert_file_scope_asm(
+        &self,
+        span: Span,
+        asm_string: &str,
+    ) -> TranslationResult<ConvertedDecl> {
+        self.use_feature("asm");
+
+        self.with_cur_file_item_store(|item_store| {
+            item_store.add_use(true, vec!["core".into(), "arch".into()], "global_asm");
+        });
+
+        let tokens: TokenStream =
+            vec![TokenTree::Literal(proc_macro2::Literal::string(asm_string))]
+                .into_iter()
+                .collect();
+        let mac = mk().mac(
+            mk().path(vec!["global_asm"]),
+            tokens,
+            MacroDelimiter::Paren(Default::default()),
+        );
+        let item = mk().span(span).mac_item(mac);
+
+        Ok(ConvertedDecl::Item(item))
     }
 
     pub fn convert_cfg(

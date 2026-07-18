@@ -2599,6 +2599,14 @@ impl ConversionContext {
                     self.processed_nodes.insert(new_id, OTHER_DECL);
                 }
 
+                ASTEntryTag::TagFileScopeAsmDecl if expected_ty & DECL != 0 => {
+                    let asm_string = from_value::<String>(node.extras[0].clone())
+                        .expect("Expected file-scope asm string");
+                    let file_scope_asm = CDeclKind::FileScopeAsm { asm_string };
+                    self.add_decl(new_id, located(node, file_scope_asm));
+                    self.processed_nodes.insert(new_id, OTHER_DECL);
+                }
+
                 t => panic!("Could not translate node {:?} as type {}", t, expected_ty),
             }
         }
