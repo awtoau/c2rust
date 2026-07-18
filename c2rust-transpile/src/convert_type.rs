@@ -271,17 +271,23 @@ impl TypeConverter {
             }
 
             CTypeKind::Union(decl_id) => {
-                let new_name = self.resolve_decl_name(decl_id).unwrap();
+                let new_name = self
+                    .resolve_decl_name(decl_id)
+                    .ok_or_else(|| format_err!("Unknown decl id {:?}", decl_id))?;
                 Ok(mk().path_ty(vec![new_name]))
             }
 
             CTypeKind::Enum(decl_id) => {
-                let new_name = self.resolve_decl_name(decl_id).unwrap();
+                let new_name = self
+                    .resolve_decl_name(decl_id)
+                    .ok_or_else(|| format_err!("Unknown decl id {:?}", decl_id))?;
                 Ok(mk().path_ty(vec![new_name]))
             }
 
             CTypeKind::Typedef(decl_id) => {
-                let new_name = self.resolve_decl_name(decl_id).unwrap();
+                let new_name = self
+                    .resolve_decl_name(decl_id)
+                    .ok_or_else(|| format_err!("Unknown decl id {:?}", decl_id))?;
                 Ok(mk().path_ty(vec![new_name]))
             }
 
