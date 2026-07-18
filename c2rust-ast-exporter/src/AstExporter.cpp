@@ -2004,6 +2004,32 @@ class TranslateASTVisitor final
         return true;
     }
 
+    // OpaqueValueExpr binds the "common" operand of a GNU `?:` (omitted
+    // middle operand, e.g. `x ?: y`) inside the `getCond()`/`getTrueExpr()`
+    // subexpressions of the surrounding BinaryConditionalOperator - see
+    // BinaryConditionalOperator's ctor assert in clang/AST/Expr.h
+    // ("assert(OpaqueValue->getSourceExpr() == common)"). VisitBinaryConditionalOperator
+    // above never needs this node itself, since it reaches the shared operand
+    // directly via getCommon()/getFalseExpr(), bypassing the opaque wrapper
+    // entirely. But the base RecursiveASTVisitor still walks into
+    // getCond()/getTrueExpr() (shouldVisitImplicitCode() is true), which visits
+    // this OpaqueValueExpr and, through it, revisits the same shared operand a
+    // second time as this node's *child*. Without a handler here, this node's
+    // address never enters the ast_nodes map, so any other node whose
+    // getSubExpr()/getChild() resolves to this OpaqueValueExpr (e.g. an
+    // ImplicitCastExpr doing an IntegralCast/BitCast to unify the `?:`
+    // branches' types) ends up with a "Missing child" - the referenced
+    // OpaqueValueExpr id, not found in ast_nodes - and the whole file's AST is
+    // rejected as invalid. Always encoding it as a transparent one-child
+    // wrapper around its source expression (decoded as CExprKind::Paren on
+    // the Rust side) closes the gap the same way VisitFileScopeAsmDecl closed
+    // the analogous top_nodes/ast_nodes gap for file-scope asm.
+    bool VisitOpaqueValueExpr(OpaqueValueExpr *OVE) {
+        std::vector<void *> childIds = {OVE->getSourceExpr()};
+        encode_entry(OVE, TagOpaqueValueExpr, childIds);
+        return true;
+    }
+
     bool VisitDeclRefExpr(DeclRefExpr *DRE) {
 
         // This avoids an infinite recursive loop that can be caused by the
@@ -2575,6 +2601,32 @@ class TranslateASTVisitor final
         // This might be the only occurrence of this type in the translation unit
         typeEncoder.VisitQualTypeOf(t, D);
 
+        return true;
+    }
+
+    // IndirectFieldDecl names a member reached through an anonymous
+    // struct/union - e.g. a struct_group_tagged()-style layout
+    // (include/linux/stddef.h) where an outer struct wraps an unnamed
+    // `union { struct {...}; struct posix_acl_hdr {...} hdr; }`. Clang
+    // synthesizes one IndirectFieldDecl per such member, chaining through
+    // the anonymous field(s) down to the real FieldDecl - see
+    // clang/AST/Decl.h's IndirectFieldDecl::chain()/getAnonField(). This
+    // decl kind has no Visit/Traverse override anywhere in this file, so
+    // (like FileScopeAsmDecl before it, and OpaqueValueExpr above) the base
+    // RecursiveASTVisitor still reaches it - most commonly via
+    // VisitDeclRefExpr's explicit `TraverseDecl(decl)` call on a reference's
+    // getDecl()->getCanonicalDecl() - without ever calling encode_entry for
+    // it, leaving any DeclRefExpr/MemberExpr that names it with a child id
+    // absent from ast_nodes. Encode it as a transparent pass-through to its
+    // terminal real FieldDecl (getAnonField(), the actual storage location
+    // both C and Rust need for offset/size purposes), decoded as
+    // CDeclKind::NonCanonicalDecl on the Rust side, the same representation
+    // already used for FieldDecl's own non-canonical-redeclaration case just
+    // above.
+    bool VisitIndirectFieldDecl(IndirectFieldDecl *D) {
+        std::vector<void *> childIds = {D->getAnonField()->getCanonicalDecl()};
+        encode_entry(D, TagIndirectFieldDecl, D->getSourceRange(), childIds,
+                     D->getType());
         return true;
     }
 

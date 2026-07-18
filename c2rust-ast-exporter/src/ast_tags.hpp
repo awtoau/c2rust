@@ -22,6 +22,7 @@ enum ASTEntryTag {
     TagUnionDecl,
 
     TagNonCanonicalDecl,
+    TagIndirectFieldDecl,
 
     TagStaticAssertDecl,
     TagFileScopeAsmDecl,
@@ -79,6 +80,7 @@ enum ASTEntryTag {
     TagBuiltinBitCastExpr,
     TagMaterializeTemporaryExpr,
     TagExprWithCleanups,
+    TagOpaqueValueExpr,
 
     // Wrapper expressions
     TagFullExpr, // unused

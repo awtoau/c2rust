@@ -1384,6 +1384,26 @@ impl ConversionContext {
                     self.expr_possibly_as_stmt(expected_ty, new_id, node, expr);
                 }
 
+                // OpaqueValueExpr binds the shared "common" operand of a GNU
+                // `x ?: y` conditional inside its condition/true-branch
+                // subexpressions (see AstExporter.cpp's VisitOpaqueValueExpr
+                // for the full explanation of why this node needs a table
+                // entry at all: BinaryConditional's own translation below
+                // never reads it, but other nodes reached via the default
+                // AST walk - e.g. an ImplicitCast unifying the `?:`
+                // branches' types - hold a child id pointing at it). It's
+                // exported as a transparent single-child wrapper around its
+                // source expression, so decode it exactly like TagParenExpr.
+                ASTEntryTag::TagOpaqueValueExpr if expected_ty & (EXPR | STMT) != 0 => {
+                    let wrapped = node.children[0].expect("Expected source expression for opaque value");
+                    let ty_old = node.type_id.expect("Expected expression to have type");
+                    let ty = self.visit_qualified_type(ty_old);
+
+                    let expr = CExprKind::Paren(ty, self.visit_expr(wrapped));
+
+                    self.expr_possibly_as_stmt(expected_ty, new_id, node, expr);
+                }
+
                 ASTEntryTag::TagOffsetOfExpr if expected_ty & (EXPR | STMT) != 0 => {
                     let ty_old = node.type_id.expect("Expected expression to have type");
                     let ty = self.visit_qualified_type(ty_old);
@@ -2572,6 +2592,24 @@ impl ConversionContext {
                             _ => {}
                         }
                     }
+                }
+
+                // A member reached through an anonymous struct/union (e.g.
+                // Linux's struct_group_tagged() idiom) - see AstExporter.cpp's
+                // VisitIndirectFieldDecl for why this needs a table entry at
+                // all. Exported as a transparent pointer to the real,
+                // terminal FieldDecl backing it (IndirectFieldDecl::
+                // getAnonField()), so decode it the same way as
+                // TagNonCanonicalDecl: nothing here ever wraps a struct/union
+                // itself, so none of that arm's is_packed bookkeeping applies.
+                ASTEntryTag::TagIndirectFieldDecl if expected_ty & DECL != 0 => {
+                    let canonical_decl = node.children[0]
+                        .expect("IndirectFieldDecl must point to its terminal FieldDecl");
+                    let canonical_decl = self.visit_decl(canonical_decl);
+                    let record = CDeclKind::NonCanonicalDecl { canonical_decl };
+
+                    self.add_decl(new_id, located(node, record));
+                    self.processed_nodes.insert(new_id, OTHER_DECL);
                 }
 
                 ASTEntryTag::TagStaticAssertDecl if expected_ty & DECL != 0 => {
