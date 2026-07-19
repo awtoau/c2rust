@@ -23,11 +23,27 @@ impl<'c> Translation<'c> {
         };
         let mut expr = mk().lit_expr(lit);
 
+        // A negative *constant* cast to an unsigned target type (e.g. C's
+        // well-defined `(size_t)-1`, which two's-complement-wraps to the
+        // unsigned type's max value) cannot be emitted as Rust's `-<val> as
+        // <ty>`: unary `-` on an unsigned-typed literal is `E0600` and does
+        // not parse. Since `negative` here always means "negate this
+        // compile-time-constant literal", not "translate a runtime negation
+        // expression" (that path is `wrapping_neg_expr`/`neg_expr` in
+        // `convert_negate_operator`), it's safe to route the constant case
+        // through the same wrapping-negation semantics via `.wrapping_neg()`
+        // on the target-typed value, which is valid Rust and bit-identical
+        // to the C wraparound for any target width.
+        let target_ty = self.convert_type(ty.ctype)?;
+        if negative && self.ast_context.resolve_type(ty.ctype).kind.is_unsigned_integral_type() {
+            expr = mk().cast_expr(expr, target_ty);
+            return Ok(wrapping_neg_expr(expr));
+        }
+
         if negative {
             expr = neg_expr(expr);
         }
 
-        let target_ty = self.convert_type(ty.ctype)?;
         Ok(mk().cast_expr(expr, target_ty))
     }
 
