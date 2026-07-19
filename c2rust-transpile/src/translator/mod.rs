@@ -257,6 +257,15 @@ impl FuncContext {
         self.name.as_ref().unwrap()
     }
 
+    /// Like [`Self::get_name`], but `None` instead of panicking when no
+    /// function is currently being translated (e.g. while converting a
+    /// file-scope static initializer expression, which runs outside any
+    /// `convert_function_inner` call and so never had [`Self::enter_new`]
+    /// called against it).
+    pub fn get_name_opt(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
     pub fn get_va_list_arg_name(&self) -> &str {
         self.va_list_arg_name.as_ref().unwrap()
     }
