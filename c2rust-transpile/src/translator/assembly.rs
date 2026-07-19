@@ -59,6 +59,17 @@ enum Arch {
     Riscv,
 }
 
+/// Sentinel "register class" string used as the resolved constraint for a
+/// lone RISC-V `"I"`/`"J"`/`"K"` immediate-only constraint (see
+/// `translate_machine_constraint`'s `Arch::Riscv` arm). Not a real Rust
+/// asm! register class name - `convert_asm` intercepts operands resolved
+/// to this string before they ever reach normal register-operand emission,
+/// and either rewrites them to a genuine `const <value>` operand (if the
+/// operand expression is provably compile-time-constant, see
+/// `try_eval_const_int`) or raises a translation error identical to the
+/// one this constraint used to raise unconditionally.
+const RISCV_LONE_IMMEDIATE_SENTINEL: &str = "c2rust_riscv_lone_immediate";
+
 /// Parse a machine architecture from a target tuple. This is a best-effort attempt.
 fn parse_arch(target_tuple: &str) -> Option<Arch> {
     if target_tuple.starts_with("x86_64") {
@@ -341,22 +352,158 @@ fn translate_machine_constraint(constraint: &str, arch: Arch) -> Option<(&str, b
             // valid fallback and is what `parse_constraints` now resolves
             // to before this function is ever reached for those cases (see
             // the early `break` on the 'r' arm above). If we get here with
-            // a *lone* immediate-only letter, the operand's value is a
-            // compile-time-unknown expression from the translator's point
-            // of view, and Rust's `asm!` immediates (`const` operands)
+            // a *lone* immediate-only letter, the operand's value is,
+            // *from this function's point of view*, a compile-time-unknown
+            // expression, and Rust's `asm!` immediates (`const` operands)
             // require operands to be actual compile-time constants - not
-            // just "was a constant when GCC compiled the original C". There
-            // is no way to soundly force that here, so refuse to guess and
-            // let the caller fall through to its existing
-            // recognize-failure path, which raises a clear translation
-            // error for the containing statement instead of emitting an
-            // asm! that either fails to build or silently mis-encodes the
-            // operand.
-            "I" | "J" | "K" => return None,
+            // just "was a constant when GCC compiled the original C". This
+            // function only sees the constraint letter, not the operand
+            // expression, so it cannot itself tell those two cases apart.
+            //
+            // Rather than refuse unconditionally, resolve to this sentinel
+            // register-class string, which is not a real Rust asm! register
+            // class. `convert_asm` (the only caller with the operand's
+            // `CExprId` in hand) recognizes it and attempts a narrow,
+            // syntactic compile-time evaluation of the operand expression
+            // (see `try_eval_const_int`); only if that succeeds does it
+            // emit a genuine Rust `const <value>` operand. If evaluation
+            // fails - the expression references a runtime variable, a
+            // function call, or any construct the narrow evaluator does not
+            // (by design) understand - `convert_asm` raises the same clear
+            // translation error this function used to raise directly here,
+            // so the containing statement is still rejected exactly as
+            // before rather than risking a silently mis-encoded operand.
+            "I" | "J" | "K" => RISCV_LONE_IMMEDIATE_SENTINEL,
             _ => return None,
         },
     };
     Some((constraint, *mem))
+}
+
+/// Attempt to evaluate a C expression as a compile-time-constant integer,
+/// entirely syntactically (no target-specific type-width/overflow
+/// semantics are modeled - this is deliberately not a general C constant
+/// expression evaluator, see below).
+///
+/// This exists only to let a lone RISC-V `"I"`/`"J"`/`"K"` inline-asm
+/// immediate operand (see `RISCV_LONE_IMMEDIATE_SENTINEL` and its caller in
+/// `convert_asm`) become a real Rust `asm!` `const` operand when - and only
+/// when - the operand expression is provably a compile-time constant by
+/// construction, not merely "happened to be constant when GCC compiled the
+/// original C". Two shapes of real-world kernel usage motivate exactly the
+/// operators handled here (see `arch/riscv/include/asm/errata_list.h`'s
+/// `ALT_SVPBMT`/`ALT_THEAD_MAE` macros, awtoau/c2rust issue tracking the
+/// `8250_port.c` reproduction): plain integer literals, and shift/mask
+/// arithmetic over them produced by macro substitution (`prot##_SVPBMT >>
+/// ALT_SVPBMT_SHIFT` with `_SVPBMT`-suffixed macros expanding to `(1UL <<
+/// N) | (1UL << M)`-shaped constant expressions). Clang does not
+/// constant-fold these before c2rust's AST processing ever sees them (even
+/// under `-Os`) - confirmed directly against the actual exported AST for
+/// this file - so this function walks the *unfolded* `CExprKind` tree.
+///
+/// Deliberately handles only: integer literals; `Paren`/cast unwrapping;
+/// unary negate/complement/plus; and the binary operators `>>`, `<<`, `|`,
+/// `&`, `+`, `-`, `*` (kept narrow per this operand's real usage, not a
+/// general evaluator - e.g. no `/`, `%`, comparisons, ternary, or anything
+/// with a side effect); and named-integer-constant references, i.e. a
+/// `DeclRef` to a `static const`/`enum` decl whose own initializer/value is
+/// itself evaluable by this same function (recursively, so a chain of
+/// `const`-to-`const` references resolves as long as every link is one of
+/// the forms above). Anything else - a `DeclRef` to a plain (non-const)
+/// variable, a function call, `sizeof`, etc. - returns `None`, and the
+/// caller must treat that exactly like today's outright refusal: fail the
+/// containing statement's translation rather than guess.
+///
+/// Returns the evaluated value as `i128` (wide enough to hold any `u64`
+/// literal or intermediate shift/mask result without overflow ambiguity);
+/// the caller narrows to `i64` for `signed_int_expr`, which is more than
+/// sufficient for RISC-V's 12-bit/5-bit/zero immediate encodings.
+fn try_eval_const_int(ast_context: &TypedAstContext, expr_id: CExprId) -> Option<i128> {
+    // Recursion is bounded by the depth of the (small, macro-generated)
+    // arithmetic expression tree itself; there is no risk of unbounded or
+    // cyclic recursion since `CExprId`s form a DAG over strictly smaller
+    // subexpressions for every case handled below.
+    match &ast_context[expr_id].kind {
+        CExprKind::Literal(_, CLiteral::Integer(value, _)) => Some(*value as i128),
+
+        CExprKind::Literal(_, CLiteral::Character(value)) => Some(*value as i128),
+
+        // Parens, implicit/explicit casts, and clang's `ConstantExpr`
+        // wrapper (inserted in contexts like array bounds/case labels -
+        // not GCC-asm operands, but harmless to unwrap defensively here
+        // too) all carry the same value through unchanged; this evaluator
+        // is syntactic and does not model width/signedness truncation from
+        // casts, which is fine for this narrow use (shift amounts and
+        // page-table-bit masks that fit comfortably in every integer type
+        // actually involved).
+        CExprKind::Paren(_, subexpr)
+        | CExprKind::ImplicitCast(_, subexpr, _, _, _)
+        | CExprKind::ExplicitCast(_, subexpr, _, _, _)
+        | CExprKind::ConstantExpr(_, subexpr, _) => try_eval_const_int(ast_context, *subexpr),
+
+        CExprKind::Unary(_, op, subexpr, _) => {
+            let value = try_eval_const_int(ast_context, *subexpr)?;
+            match op {
+                CUnOp::Plus => Some(value),
+                CUnOp::Negate => Some(-value),
+                CUnOp::Complement => Some(!value),
+                // Anything else (address-of, deref, increment/decrement,
+                // logical not, etc.) is either not integer-constant or not
+                // syntactically a pure value computation; refuse rather
+                // than guess.
+                _ => None,
+            }
+        }
+
+        CExprKind::Binary(_, op, lhs, rhs, _, _) => {
+            let lhs = try_eval_const_int(ast_context, *lhs)?;
+            let rhs = try_eval_const_int(ast_context, *rhs)?;
+            match op {
+                CBinOp::ShiftLeft => Some(lhs << rhs),
+                CBinOp::ShiftRight => Some(lhs >> rhs),
+                CBinOp::BitOr => Some(lhs | rhs),
+                CBinOp::BitAnd => Some(lhs & rhs),
+                CBinOp::BitXor => Some(lhs ^ rhs),
+                CBinOp::Add => Some(lhs + rhs),
+                CBinOp::Subtract => Some(lhs - rhs),
+                CBinOp::Multiply => Some(lhs * rhs),
+                // Division/modulus are deliberately excluded: no real
+                // usage needs them here, and they introduce a
+                // divide-by-zero case this function would otherwise need
+                // to reject at translation time rather than evaluate.
+                // Comparisons/logical/assignment operators are not integer
+                // *value* computations at all.
+                _ => None,
+            }
+        }
+
+        // A reference to a named constant: resolve through `static
+        // const`-shaped variables (recursing into their initializer) and
+        // enum constants (whose value clang has already evaluated for us).
+        // Any other declaration kind (a plain mutable variable, a
+        // function, etc.) is not a compile-time constant from this
+        // evaluator's point of view.
+        CExprKind::DeclRef(_, decl_id, _) => match &ast_context.index(*decl_id).kind {
+            CDeclKind::Variable {
+                initializer: Some(init),
+                typ,
+                ..
+            } if typ.qualifiers.is_const => try_eval_const_int(ast_context, *init),
+            CDeclKind::EnumConstant { value, .. } => Some(match value {
+                ConstIntExpr::U(v) => *v as i128,
+                ConstIntExpr::I(v) => *v as i128,
+            }),
+            _ => None,
+        },
+
+        // Everything else (function calls, member access, array
+        // subscript, ternary, `sizeof`/`alignof`, string literals, a
+        // `DeclRef` to a non-const variable, ...) is not a construct this
+        // narrowly-scoped evaluator understands as a pure compile-time
+        // value computation. Refuse rather than guess, matching this
+        // operand's existing "no output rather than wrong output" policy.
+        _ => None,
+    }
 }
 
 /// Translate a template modifier from llvm/gcc asm template argument modifiers
@@ -412,6 +559,15 @@ struct BidirAsmOperand {
     // At least one of these is non-None
     in_expr: Option<(usize, CExprId)>,
     out_expr: Option<(usize, CExprId)>,
+    /// `Some(value)` for a resolved RISC-V lone immediate constraint (see
+    /// `RISCV_LONE_IMMEDIATE_SENTINEL`/`try_eval_const_int`): this operand
+    /// is emitted as a genuine `const <value>` asm! operand instead of the
+    /// normal `dir_spec(register_class) expr` form - `const` operands have
+    /// no direction, register class, or backing expression at all, so
+    /// every other field above is ignored for such an operand except
+    /// `in_expr`'s index (still needed for the template-reference/tied-
+    /// operand bookkeeping that runs before this operand's kind is known).
+    const_value: Option<i128>,
 }
 
 impl BidirAsmOperand {
@@ -1048,6 +1204,20 @@ impl<'c> Translation<'c> {
             if in_expr.is_some() {
                 dir_spec = dir_spec.with_in();
             }
+            // A lone RISC-V immediate constraint (see
+            // `RISCV_LONE_IMMEDIATE_SENTINEL`) is never valid GCC syntax on
+            // an output operand (I/J/K only ever appear as GCC *input*
+            // constraints - an immediate cannot be written to); reject it
+            // here exactly as `translate_machine_constraint` used to
+            // reject it unconditionally, rather than let it silently fall
+            // through to `convert_asm`'s later register-operand emission
+            // with a bogus "register class" name.
+            if parsed == RISCV_LONE_IMMEDIATE_SENTINEL {
+                return Err(TranslationError::generic(
+                    "RISC-V 'I'/'J'/'K' immediate-only constraint is not valid on an \
+                     output asm operand",
+                ));
+            }
             args.push(BidirAsmOperand {
                 dir_spec,
                 mem_only,
@@ -1055,6 +1225,7 @@ impl<'c> Translation<'c> {
                 constraints: parsed,
                 in_expr,
                 out_expr: Some((output_idx, output.expression)),
+                const_value: None,
             });
         }
         // Add unmatched inputs
@@ -1063,6 +1234,39 @@ impl<'c> Translation<'c> {
             .chain(other_inputs.into_iter())
         {
             let (dir_spec, mem_only, parsed) = parse_constraints(&input.constraints, arch)?;
+
+            // A lone RISC-V immediate constraint (see
+            // `RISCV_LONE_IMMEDIATE_SENTINEL`): attempt to evaluate the
+            // operand expression as a compile-time constant so it can
+            // become a real `const` asm! operand. If that fails, raise the
+            // same translation error `translate_machine_constraint` used
+            // to raise directly for *every* lone I/J/K constraint,
+            // preserving today's refusal behavior exactly for any operand
+            // that is not provably constant.
+            let const_value = if parsed == RISCV_LONE_IMMEDIATE_SENTINEL {
+                match try_eval_const_int(&self.ast_context, input.expression) {
+                    Some(value) => Some(value),
+                    None => {
+                        warn!(
+                            "RISC-V 'I'/'J'/'K' inline asm operand is not a \
+                            compile-time-constant expression this translator can \
+                            evaluate; refusing to guess."
+                        );
+                        return Err(TranslationError::new(
+                            None,
+                            failure::err_msg(
+                                "Inline assembly constraint 'I'/'J'/'K' operand is not a \
+                                 provably compile-time-constant expression"
+                                    .to_owned(),
+                            )
+                            .context(TranslationErrorKind::Generic),
+                        ));
+                    }
+                }
+            } else {
+                None
+            };
+
             args.push(BidirAsmOperand {
                 dir_spec,
                 mem_only,
@@ -1070,6 +1274,7 @@ impl<'c> Translation<'c> {
                 constraints: parsed,
                 in_expr: Some((input_idx, input.expression)),
                 out_expr: None,
+                const_value,
             });
         }
 
@@ -1182,14 +1387,46 @@ impl<'c> Translation<'c> {
         // to let `pure` be emitted on an asm! with no actual output,
         // hard-rejected by rustc (`asm with the 'pure' option must have at
         // least one output`).
+        // `const` operands (see `BidirAsmOperand::const_value`) are excluded
+        // regardless of their (otherwise-unused) `dir_spec`: a `const`
+        // asm! operand is a compile-time value substituted into the
+        // template text, never a real register read/write, so it can never
+        // satisfy the `pure` option's "at least one real output" rule.
         let has_real_output = args
             .iter()
-            .any(|op| !matches!(op.dir_spec, ArgDirSpec::In));
+            .any(|op| op.const_value.is_none() && !matches!(op.dir_spec, ArgDirSpec::In));
 
         // Outputs and Inputs
         let mut operand_renames = HashMap::new();
         for operand in args {
             tokens.push(TokenTree::Punct(Punct::new(',', Alone)));
+
+            // A resolved RISC-V lone immediate (see
+            // `BidirAsmOperand::const_value`) is a `const <expr>` asm!
+            // operand: no direction keyword, no register class, and no
+            // backing C expression to `convert_expr` at all - the value
+            // was already fully evaluated by `try_eval_const_int` back
+            // when this operand was built. Emit it and move straight to
+            // the next operand, bypassing all the register-operand
+            // machinery below (tied-operand casts, mem-only borrows,
+            // dir_spec/constraint tokens, ...), none of which apply here.
+            if let Some(value) = operand.const_value {
+                push_expr(&mut tokens, mk().ident_expr("const"));
+                let value = i64::try_from(value).unwrap_or_else(|_| {
+                    // RISC-V's largest lone-immediate constraint ('I') is a
+                    // 12-bit signed value; even the widest realistic
+                    // operand here (a shift/mask over 64-bit page-table
+                    // bits) fits comfortably in i64. This can only trip if
+                    // some future caller of `try_eval_const_int` feeds it
+                    // an expression whose evaluated magnitude exceeds i64,
+                    // which none of the operators this evaluator supports
+                    // can produce from realistic RISC-V asm immediate
+                    // operands; clamp defensively rather than panic.
+                    if value < 0 { i64::MIN } else { i64::MAX }
+                });
+                push_expr(&mut tokens, signed_int_expr(value));
+                continue;
+            }
 
             // First, convert output expr if present
             let out_expr = if let Some((output_idx, out_expr)) = operand.out_expr {
