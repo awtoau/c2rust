@@ -4662,16 +4662,39 @@ impl<'c> Translation<'c> {
         let source_ty_kind = &self.ast_context.resolve_type(source_cty.ctype).kind;
         let target_ty_kind = &self.ast_context.resolve_type(target_cty.ctype).kind;
 
-        let kind = kind.unwrap_or_else(|| {
-            CastKind::from_types(source_ty_kind, target_ty_kind).unwrap_or_else(|| {
-                warn!(
-                    "Unknown CastKind for {source_ty_kind:?} to {target_ty_kind:?} cast. \
-                    Defaulting to BitCast",
-                );
+        let kind = match kind {
+            Some(kind) => kind,
+            None => {
+                // CastKind::from_types() has no arm for Complex-typed operands
+                // (its own comment: "Ignoring Complex casts for now") and
+                // falls through to its wildcard, which the caller used to
+                // treat identically to every other "no rule matched" case:
+                // warn and silently default to CastKind::BitCast. BitCast is
+                // convert_pointer_to_pointer_cast's literal-reinterpret path
+                // — plausible-looking but not a correct translation of a
+                // complex-number conversion. make_cast_full's own sibling
+                // dispatch on real Clang-supplied CastKinds already rejects
+                // every complex-cast kind with a loud Err (see the
+                // "TODO casts with complex numbers not supported" arm
+                // below) — this synthesized-cast path is the one place
+                // Complex operands didn't get that same treatment.
+                if matches!(source_ty_kind, CTypeKind::Complex(..))
+                    || matches!(target_ty_kind, CTypeKind::Complex(..))
+                {
+                    return Err(TranslationError::generic(
+                        "TODO casts with complex numbers not supported",
+                    ));
+                }
+                CastKind::from_types(source_ty_kind, target_ty_kind).unwrap_or_else(|| {
+                    warn!(
+                        "Unknown CastKind for {source_ty_kind:?} to {target_ty_kind:?} cast. \
+                        Defaulting to BitCast",
+                    );
 
-                CastKind::BitCast
-            })
-        });
+                    CastKind::BitCast
+                })
+            }
+        };
 
         if source_ty_kind == target_ty_kind && kind != CastKind::LValueToRValue {
             return Ok(val);
