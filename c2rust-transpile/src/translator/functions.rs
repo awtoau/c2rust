@@ -351,6 +351,23 @@ impl<'c> Translation<'c> {
                         c_ast::Attribute::AlwaysInline => mk_.call_attr("inline", vec!["always"]),
                         c_ast::Attribute::Cold => mk_.single_attr("cold"),
                         c_ast::Attribute::NoInline => mk_.call_attr("inline", vec!["never"]),
+                        c_ast::Attribute::Used => mk_.single_attr("used"),
+                        // GCC/Clang attributes are per-declaration lists, not
+                        // exclusive-choice: a function can carry `section`
+                        // alongside `cold`/`used`/etc (e.g. the kernel's
+                        // `__init` macro expands to
+                        // `__section(".init.text") __cold __latent_entropy`
+                        // all on the same decl). This loop visits every
+                        // attribute in `attrs` once, so each recognized
+                        // variant needs its own arm that updates `mk_`
+                        // (instead of falling into `_ => continue`) to
+                        // survive translation alongside the others. `Section`
+                        // was previously handled only on the static/variable
+                        // path (see the `link_section` arm below in the
+                        // static-def attribute loop), never for function
+                        // items, so `__section(...)` was silently dropped
+                        // here whenever a defined function also had `cold`.
+                        c_ast::Attribute::Section(name) => mk_.str_attr("link_section", name),
                         _ => continue,
                     };
                 }
