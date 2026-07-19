@@ -295,6 +295,17 @@ pub struct Translation<'c> {
     /// for why this string is the only place the GPL/non-GPL distinction
     /// survives preprocessing.
     export_symbol_licenses: IndexMap<String, bool>,
+    /// `accessor CDeclId -> fix` for the register-variable-accessor
+    /// pattern (see `find_register_var_accessors`'s doc comment), computed
+    /// once up front because it requires whole-TU knowledge (matching a
+    /// `Variable` decl against a sibling `Function` decl) that isn't
+    /// available while converting either decl in isolation.
+    register_var_accessors: RefCell<IndexMap<CDeclId, RegisterVarAccessor>>,
+    /// Register-variable `CDeclId`s consumed by an entry in
+    /// `register_var_accessors`, so `convert_decl`'s `Variable` arm can
+    /// elide the fabricated `.bss` static instead of emitting it
+    /// alongside the now-fixed accessor.
+    register_vars_with_accessor: RefCell<IndexSet<CDeclId>>,
     /// Sets of imports deferred while translating nested expressions for caching. Imports are
     /// deferred when caching translations to make them pure and thus cache the translation
     /// alongside its required imports. Each additional nested level of caching translation
@@ -449,6 +460,134 @@ fn parse_export_symbol_licenses(ast_context: &TypedAstContext) -> IndexMap<Strin
         }
     }
     licenses
+}
+
+/// A same-TU register-variable accessor pattern detected by
+/// `find_register_var_accessors`: a `CDeclKind::Variable` bound to a live
+/// CPU register via GCC/Clang's register-variable extension (e.g.
+/// `register unsigned long tp asm("tp")`, see `is_register_storage` /
+/// `Attribute::AsmLabel`) together with a function in the same TU whose
+/// entire body is `return <that variable>;` (e.g. `get_current()`).
+///
+/// c2rust has no representation for a variable with no backing memory, so
+/// by default it fabricates a real `#[no_mangle] pub static mut` in `.bss`
+/// - always null/0, since nothing in the translated TU ever assigns it.
+/// When an accessor like this is genuinely called, that fabricated static
+/// is a guaranteed null-pointer-shaped bug at the call site (confirmed
+/// twice in production: linux-rs issues #30/#31). When this pattern is
+/// detected, `convert_function` rewrites the accessor's body to a real
+/// inline-asm register read instead, and the `Variable` arm of
+/// `convert_decl` elides the now-unused fabricated static entirely.
+///
+/// This is a narrow, targeted match - only the exact "register variable +
+/// single-statement direct-return accessor" shape. Register variables
+/// without a same-TU accessor, or with an accessor whose body is anything
+/// more than a bare `return var;`, keep today's fabricated-static
+/// behavior unchanged (see awtoau/c2rust#22 for why: 245 of 552 corpus
+/// files have the dead-but-harmless shape and must not regress).
+#[derive(Debug, Clone)]
+struct RegisterVarAccessor {
+    /// The register/label name from `asm("...")`, e.g. `"tp"`.
+    register_name: String,
+    /// The accessor function's return type, needed for the `let result:
+    /// <ty>` binding in the synthesized inline-asm body.
+    return_type: CQualTypeId,
+}
+
+/// Scan every top-level `Function` decl with a body in the TU for the
+/// `return <register-variable>;` shape, and pair each match up with its
+/// target `CDeclKind::Variable`. Returns a map from the *accessor
+/// function's* `CDeclId` to the fix to apply, plus the set of register
+/// variable `CDeclId`s that were matched (so their fabricated statics can
+/// be elided even though the accessor is a separate decl).
+///
+/// Must run after `prune_unwanted_decls`, so that an accessor which is
+/// itself dead code (never called) has already been pruned from
+/// `c_decls_top` and is naturally excluded here - preserving today's
+/// "declared but never read, safe as-is" behavior for that half of the
+/// corpus without any extra bookkeeping.
+fn find_register_var_accessors(
+    ast_context: &TypedAstContext,
+) -> (IndexMap<CDeclId, RegisterVarAccessor>, IndexSet<CDeclId>) {
+    // First, find every register-variable-extension VarDecl and its
+    // asm("...") label.
+    let register_vars: IndexMap<CDeclId, String> = ast_context
+        .c_decls_top
+        .iter()
+        .filter_map(|&decl_id| {
+            let decl = ast_context.get_decl(&decl_id)?;
+            let CDeclKind::Variable {
+                is_register_storage: true,
+                ref attrs,
+                ..
+            } = decl.kind
+            else {
+                return None;
+            };
+            attrs.iter().find_map(|attr| match attr {
+                Attribute::AsmLabel(label) => Some((decl_id, label.clone())),
+                _ => None,
+            })
+        })
+        .collect();
+
+    if register_vars.is_empty() {
+        return (IndexMap::new(), IndexSet::new());
+    }
+
+    let mut accessors = IndexMap::new();
+    let mut matched_vars = IndexSet::new();
+
+    for &decl_id in &ast_context.c_decls_top {
+        let Some(decl) = ast_context.get_decl(&decl_id) else {
+            continue;
+        };
+        let CDeclKind::Function {
+            body: Some(body_id),
+            typ,
+            ..
+        } = decl.kind
+        else {
+            continue;
+        };
+
+        // Body must be a single-statement compound: `{ return <expr>; }`.
+        let CStmtKind::Compound(ref stmts) = ast_context[body_id].kind else {
+            continue;
+        };
+        let [only_stmt] = stmts.as_slice() else {
+            continue;
+        };
+        let CStmtKind::Return(Some(ret_expr_id)) = ast_context[*only_stmt].kind else {
+            continue;
+        };
+
+        // The returned expression, modulo casts (e.g. the implicit
+        // lvalue-to-rvalue cast Clang inserts reading the register var),
+        // must be a DeclRef straight to one of the register variables.
+        let inner_expr_id = ast_context.unwrap_cast_expr(ret_expr_id);
+        let CExprKind::DeclRef(_, ref_decl_id, _) = ast_context[inner_expr_id].kind else {
+            continue;
+        };
+        let Some(register_name) = register_vars.get(&ref_decl_id) else {
+            continue;
+        };
+
+        let CTypeKind::Function(return_type, ..) = ast_context.resolve_type(typ).kind else {
+            continue;
+        };
+
+        accessors.insert(
+            decl_id,
+            RegisterVarAccessor {
+                register_name: register_name.clone(),
+                return_type,
+            },
+        );
+        matched_vars.insert(ref_decl_id);
+    }
+
+    (accessors, matched_vars)
 }
 
 /// Generate link attributes needed to ensure that the generated Rust libraries have the right symbol values.
@@ -937,6 +1076,14 @@ pub fn translate(
         // we simplify the translator output by omitting those.
         t.ast_context
             .prune_unwanted_decls(tcfg.preserve_unused_functions);
+
+        // Detect the register-variable-accessor pattern (awtoau/c2rust#22)
+        // now that pruning has removed any accessor that's dead code in
+        // this TU - see `find_register_var_accessors`'s doc comment.
+        let (register_var_accessors, register_vars_with_accessor) =
+            find_register_var_accessors(&t.ast_context);
+        *t.register_var_accessors.borrow_mut() = register_var_accessors;
+        *t.register_vars_with_accessor.borrow_mut() = register_vars_with_accessor;
 
         // Normalize AST types between Clang < 16 and later versions. Ensures that
         // binary and unary operators' expr types agree with their argument types
@@ -1733,6 +1880,13 @@ impl<'c> Translation<'c> {
             potential_flexible_array_members: RefCell::new(IndexSet::new()),
             macro_expansions: RefCell::new(IndexMap::new()),
             export_symbol_licenses,
+            // Populated later, in `translate()`, after
+            // `prune_unwanted_decls` has run - see
+            // `find_register_var_accessors`'s doc comment for why the
+            // ordering matters (a dead accessor must already be pruned so
+            // it's naturally excluded here).
+            register_var_accessors: RefCell::new(IndexMap::new()),
+            register_vars_with_accessor: RefCell::new(IndexSet::new()),
             deferred_imports: RefCell::new(Vec::new()),
             cleanup_guard_emitted: Cell::new(false),
             comment_context,
@@ -2311,6 +2465,22 @@ impl<'c> Translation<'c> {
                 ref attrs,
                 ..
             } if has_static_duration || has_thread_duration => {
+                // GCC/Clang's register-variable extension (`register T x
+                // asm("reg")`, e.g. arch/riscv's `riscv_current_is_tp`)
+                // has no backing memory at all - Clang still reports file-
+                // scope `SD_Static` duration for it (that's exactly why
+                // this arm would otherwise fire), but there is no real
+                // storage to fabricate a `.bss` static for. When
+                // `find_register_var_accessors` found a same-TU accessor
+                // whose body is just `return <this var>;`, that accessor
+                // gets rewritten to a real inline-asm register read (see
+                // `convert_function`) and this now-fabricated-and-unused
+                // static is elided entirely rather than left as dead code
+                // alongside the fix. See awtoau/c2rust#22.
+                if self.register_vars_with_accessor.borrow().contains(&decl_id) {
+                    return Ok(ConvertedDecl::NoItem);
+                }
+
                 // Linux's `__ADDRESSABLE(sym)` macro (include/linux/compiler.h)
                 // expands to `static void * __UNIQUE_ID(addressable_##sym)
                 // __used __section(".discard.addressable") = (void

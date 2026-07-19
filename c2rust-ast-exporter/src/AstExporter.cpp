@@ -2364,6 +2364,19 @@ class TranslateASTVisitor final
                 cbor_encode_boolean(array, is_externally_visible);
                 cbor_encode_boolean(array, is_defn);
 
+                // GCC/Clang's register-variable extension
+                // (`register unsigned long tp asm("tp")`) has no
+                // backing memory - it binds the name directly to a
+                // live CPU register. Captured explicitly here (mirrors
+                // is_extern for FunctionDecl above) so the Rust side
+                // can tell "genuinely static-duration variable" apart
+                // from "register alias with no storage at all" instead
+                // of fabricating a real .bss static for the latter.
+                // See also the attr::AsmLabel case in encodeAttribute,
+                // which carries the actual register name.
+                auto is_register_storage = VD->getStorageClass() == SC_Register;
+                cbor_encode_boolean(array, is_register_storage);
+
                 // Encode attribute names and relevant info if supported
                 CborEncoder attr_array;
                 cbor_encoder_create_array(array, &attr_array, CborIndefiniteLength);
@@ -2702,7 +2715,28 @@ class TranslateASTVisitor final
                     cbor_encode_text_stringz(
                         local,
                         alias_attr->getAliasee().str().c_str()
-                    );    
+                    );
+                };
+                break;
+
+            // GCC/Clang register-variable extension, e.g.
+            // `register unsigned long tp asm("tp")` (arch/riscv's
+            // asm/current.h uses this to bind `current`/
+            // `current_stack_pointer` to a live CPU register with no
+            // backing memory). The variable's storage class
+            // (SC_Register, see is_register_storage in VisitVarDecl)
+            // says THAT it's register-bound; this attribute carries
+            // WHICH register/label string it's bound to. Both halves
+            // are needed on the Rust side to detect the pattern and
+            // synthesize a real register read instead of a fabricated
+            // always-null `.bss` static (awtoau/c2rust#22).
+            case attr::AsmLabel:
+                extra = [attr](CborEncoder *local) {
+                    auto *asm_label_attr = dyn_cast<AsmLabelAttr>(attr);
+                    cbor_encode_text_stringz(
+                        local,
+                        asm_label_attr->getLabel().str().c_str()
+                    );
                 };
                 break;
 

@@ -3,7 +3,8 @@
 use super::*;
 use c2rust_ast_builder::CaptureBy;
 use failure::format_err;
-use proc_macro2::{TokenStream, TokenTree};
+use proc_macro2::{Literal, TokenStream, TokenTree};
+use syn::__private::ToTokens;
 
 impl<'c> Translation<'c> {
     pub fn convert_function(
@@ -62,6 +63,7 @@ impl<'c> Translation<'c> {
 
         let converted_function = self.convert_function_inner(
             ctx,
+            decl_id,
             span,
             is_global,
             is_inline,
@@ -107,6 +109,7 @@ impl<'c> Translation<'c> {
                 }
                 self.convert_function_inner(
                     ctx,
+                    decl_id,
                     span,
                     is_global,
                     false,
@@ -128,6 +131,7 @@ impl<'c> Translation<'c> {
     fn convert_function_inner(
         &self,
         ctx: ExprContext,
+        decl_id: CDeclId,
         span: Span,
         is_global: bool,
         is_inline: bool,
@@ -235,7 +239,11 @@ impl<'c> Translation<'c> {
                     body_stmts.append(&mut self.compute_variable_array_sizes(ctx, typ.ctype)?);
                 }
 
-                let mut converted_body = if let Some(bit_scan_body) =
+                let mut converted_body = if let Some(register_accessor_body) =
+                    self.register_var_accessor_body(decl_id)?
+                {
+                    register_accessor_body
+                } else if let Some(bit_scan_body) =
                     self.bit_scan_idiom_body(name, arguments, return_type)
                 {
                     bit_scan_body
@@ -398,6 +406,117 @@ impl<'c> Translation<'c> {
                 Ok(ConvertedDecl::ForeignItem(function_decl))
             }
         })
+    }
+
+    /// If `decl_id` is a same-TU accessor for a register-variable-extension
+    /// variable (see `find_register_var_accessors`'s doc comment - the
+    /// `return riscv_current_is_tp;`-shaped `get_current()` pattern from
+    /// arch/riscv's asm/current.h, awtoau/c2rust#22), return a one-statement
+    /// body that reads the register directly via inline asm instead of the
+    /// caller falling through to the normal translation (which would read
+    /// back a fabricated, always-null `.bss` static — see
+    /// `find_register_var_accessors` and the `Variable` arm of
+    /// `convert_decl` for the other half of this fix).
+    ///
+    /// This project's only confirmed use case is RISC-V (`tp`/`sp`
+    /// register-variable current-pointer bindings). For any other target
+    /// the register/mnemonic mapping is unverified, so rather than guess an
+    /// asm mnemonic that might be silently wrong, this returns `None` and
+    /// lets the caller fall through to today's fabricated-static behavior;
+    /// the accessor keeps compiling, it just isn't fixed for that target.
+    fn register_var_accessor_body(
+        &self,
+        decl_id: CDeclId,
+    ) -> TranslationResult<Option<Vec<Stmt>>> {
+        let Some(fix) = self
+            .register_var_accessors
+            .borrow()
+            .get(&decl_id)
+            .cloned()
+        else {
+            return Ok(None);
+        };
+
+        if !self.ast_context.target.starts_with("riscv") {
+            // Non-RISC-V target: the register name was captured, but this
+            // fork has no evidence for what asm mnemonic/register-class
+            // convention is correct there. Leave a breadcrumb in the
+            // generated output rather than emitting an unverified guess or
+            // silently doing nothing.
+            log::warn!(
+                "register-variable accessor detected for '{}' (register \"{}\") on non-RISC-V \
+                 target '{}': leaving today's fabricated-static behavior in place, since this \
+                 fork only has verified inline-asm codegen for RISC-V. See awtoau/c2rust#22.",
+                decl_id.0,
+                fix.register_name,
+                self.ast_context.target
+            );
+            return Ok(None);
+        }
+
+        let ret_ty = self.convert_type(fix.return_type.ctype)?;
+
+        // `Renamer::pick_name` asserts its basename starts with
+        // "c2rust_"/"C2Rust_" (see `check_c2rust_name` in renamer.rs) -
+        // matches the convention `convert_asm` already uses for its own
+        // synthesized temporaries (e.g. "c2rust_input").
+        let result_name = self.renamer.borrow_mut().pick_name("c2rust_result");
+
+        // let result: <ty>;
+        let let_result = mk().local_stmt(Box::new(mk().local(
+            mk().ident_pat(&result_name),
+            Some(ret_ty),
+            None,
+        )));
+
+        // asm!("mv {0}, <reg>", out(reg) result, options(nomem, nostack, preserves_flags));
+        let asm_template = format!("mv {{0}}, {}", fix.register_name);
+        let mut tokens: Vec<TokenTree> = vec![TokenTree::Literal(Literal::string(&asm_template))];
+        tokens.push(TokenTree::Punct(Punct::new(',', Alone)));
+        tokens.extend(mk().ident_expr("out").to_token_stream());
+        tokens.extend(mk().paren_expr(mk().ident_expr("reg")).to_token_stream());
+        tokens.extend(mk().ident_expr(&result_name).to_token_stream());
+        tokens.push(TokenTree::Punct(Punct::new(',', Alone)));
+        tokens.extend(
+            mk().call_expr(
+                mk().ident_expr("options"),
+                vec![
+                    mk().ident_expr("nomem"),
+                    mk().ident_expr("nostack"),
+                    mk().ident_expr("preserves_flags"),
+                ],
+            )
+            .to_token_stream(),
+        );
+
+        self.with_cur_file_item_store(|item_store| {
+            item_store.add_use(true, vec!["core".into(), "arch".into()], "asm");
+        });
+
+        let asm_mac = mk().mac(
+            mk().path(vec!["asm"]),
+            tokens.into_iter().collect::<TokenStream>(),
+            MacroDelimiter::Paren(Default::default()),
+        );
+        let asm_stmt = mk().semi_stmt(mk().mac_expr(asm_mac));
+
+        let result_expr = mk().ident_expr(&result_name);
+
+        // unsafe { let result: <ty>; asm!(...); result }
+        let unsafe_block = mk().unsafe_block_expr(vec![
+            let_result,
+            asm_stmt,
+            mk().expr_stmt(result_expr),
+        ]);
+
+        // `stmts_block` (used by the normal function-body assembly path)
+        // always appends a semicolon to the last statement, so a bare tail
+        // expression here would discard the unsafe block's value against a
+        // non-unit return type - use an explicit `return`, same as
+        // `bit_scan_idiom_body` does for the same reason.
+        Ok(Some(vec![mk().semi_stmt(mk().return_expr(Some(
+            unsafe_block,
+        )))]))
     }
 
     /// If `name`/`arguments`/`return_type` exactly matches one of the kernel's

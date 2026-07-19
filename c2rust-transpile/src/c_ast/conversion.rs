@@ -194,6 +194,10 @@ impl ConversionContext {
                 Some(Attribute::Alias(alias))
             }
             "always_inline" => Some(Attribute::AlwaysInline),
+            "asm" => {
+                let label = from_value(attr_info[1].clone()).expect("asm label not found");
+                Some(Attribute::AsmLabel(label))
+            }
             "cleanup" => match from_value::<ClangId>(attr_info[1].clone()) {
                 Ok(func_id) => Some(Attribute::Cleanup(self.visit_decl(func_id))),
                 Err(_) => {
@@ -2407,7 +2411,16 @@ impl ConversionContext {
                         .expect("Expected to find visibility");
                     let is_defn = from_value(node.extras[4].clone())
                         .expect("Expected to find whether decl is definition");
-                    let attributes = from_value::<Vec<Value>>(node.extras[5].clone())
+                    // See is_register_storage in AstExporter.cpp's
+                    // VisitVarDecl: true for GCC/Clang's register-variable
+                    // extension (`register unsigned long tp asm("tp")`),
+                    // which has no backing memory at all. Inserted here
+                    // (extras[5]) ahead of the attribute array, mirroring
+                    // how is_extern sits ahead of the attribute array on
+                    // TagFunctionDecl above. See awtoau/c2rust#22.
+                    let is_register_storage = from_value(node.extras[5].clone())
+                        .expect("Expected to find register-storage flag on var decl");
+                    let attributes = from_value::<Vec<Value>>(node.extras[6].clone())
                         .expect("Expected attribute array on var decl");
                     let attrs = self.parse_attributes(attributes);
 
@@ -2435,6 +2448,7 @@ impl ConversionContext {
                         has_thread_duration,
                         is_externally_visible,
                         is_defn,
+                        is_register_storage,
                         ident,
                         initializer,
                         typ,
