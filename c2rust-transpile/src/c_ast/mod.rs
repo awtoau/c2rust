@@ -1717,6 +1717,13 @@ pub enum CDeclKind {
         has_thread_duration: bool,
         is_externally_visible: bool,
         is_defn: bool,
+        /// True for GCC/Clang's register-variable extension
+        /// (`register unsigned long tp asm("tp")` - `VD->getStorageClass()
+        /// == SC_Register` on the exporter side). Such a "variable" has no
+        /// backing memory at all; the register/label name itself is
+        /// carried separately as `Attribute::AsmLabel` in `attrs`. See
+        /// awtoau/c2rust#22.
+        is_register_storage: bool,
         ident: String,
         initializer: Option<CExprId>,
         typ: CQualTypeId,
@@ -3052,6 +3059,14 @@ pub enum Attribute {
     Alias(String),
     /// __attribute__((always_inline, __always_inline__))
     AlwaysInline,
+    /// GCC/Clang's `asm("reg")` label on a `register` storage-class
+    /// variable, e.g. `register unsigned long tp asm("tp")`. The string
+    /// is the register/label name. Combined with
+    /// `CDeclKind::Variable::is_register_storage`, this identifies C's
+    /// register-variable extension (no backing memory) so the
+    /// translator can avoid fabricating a real `.bss` static for it.
+    /// See awtoau/c2rust#22.
+    AsmLabel(String),
     /// __attribute__((cleanup(func), __cleanup__(func)))
     Cleanup(CDeclId),
     /// __attribute__((cold, __cold__))
