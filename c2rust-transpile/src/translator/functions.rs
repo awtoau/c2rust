@@ -147,6 +147,37 @@ impl<'c> Translation<'c> {
     ) -> TranslationResult<ConvertedDecl> {
         self.function_context.borrow_mut().enter_new(name);
 
+        // KernelIdiomRule::VaListBuiltin (awto-au/linux-rs#37): a true
+        // C-variadic function *definition* (`...` in the parameter list,
+        // body present) has no stable Rust equivalent at all — unlike
+        // every other `VaListBuiltin` case, this isn't a type-swap, since
+        // `...` has no value to retype. c2rust's stock behavior emits
+        // `#![feature(c_variadic)]` + `core::ffi::VaList`, both unstable
+        // and (for this fork's target kernel) outside
+        // `rust_allowed_features` — dead code that can never compile.
+        // When the rule is enabled, skip translating this definition's
+        // body/signature entirely and fall through to the same
+        // `extern "C"` foreign-item path used for a declaration-only
+        // prototype (`body: None`), annotated with a structured
+        // doc-comment marker identifying exactly what a hand-written C
+        // shim needs to provide. This mirrors the hand-applied fix in
+        // linux-rs's `seq_buf.c` boot-screening (worktree
+        // `combined-c2rust-boot-17`): `seq_buf_printf`'s real body moved
+        // to `seq_buf_rs_shim.c`, Rust kept only an `extern "C"` binding
+        // for internal call sites plus (separately, via the
+        // parameter-typed helper path in `convert_function_param`) a
+        // `__builtin_va_list`-taking `seq_buf_vprintf` doing the real
+        // work. Computed before the argument-conversion loop below so
+        // that loop's own `body.is_none()` check (for extern-decl
+        // pattern mutability) sees the post-skip value.
+        let skip_variadic_def_body = is_variadic
+            && body.is_some()
+            && self
+                .tcfg
+                .kernel_idiom_rules
+                .is_enabled(crate::KernelIdiomRule::VaListBuiltin);
+        let body = if skip_variadic_def_body { None } else { body };
+
         self.with_scope(|| {
             let mut args: Vec<FnArg> = vec![];
 
@@ -415,6 +446,50 @@ impl<'c> Translation<'c> {
                         c_ast::Attribute::Alias(aliasee) => mk_.str_attr("link_name", aliasee),
                         _ => continue,
                     };
+                }
+
+                if skip_variadic_def_body {
+                    // KernelIdiomRule::VaListBuiltin (awto-au/linux-rs#37):
+                    // this `extern "C"` binding stands in for a real C-
+                    // variadic definition c2rust cannot translate at all
+                    // (see the comment where `skip_variadic_def_body` is
+                    // computed above). Leave a structured marker at the
+                    // exact spot a human/agent needs to add a hand-written
+                    // C shim, spelling out the pattern rather than making
+                    // them rediscover it: a tiny .c file with `va_start`/
+                    // `va_end` around a call to this TU's own
+                    // `__builtin_va_list`-taking helper (if one exists;
+                    // grep this file's other `VaListBuiltin`-retyped
+                    // functions for the real callee name) plus this
+                    // function's own `EXPORT_SYMBOL_GPL`/etc, if the C
+                    // original had one.
+                    for line in [
+                        format!(
+                            "C-VARIADIC DEFINITION NOT TRANSLATED: `{name}`'s C source takes \
+                             a real `...` argument list, which Rust cannot define without the \
+                             unstable `c_variadic` feature (outside this kernel's \
+                             rust_allowed_features allow-list). This binding is left as an \
+                             `extern \"C\"` declaration so existing call sites in this file \
+                             still type-check; the real definition needs a hand-written C shim."
+                        ),
+                        "Required shim shape (see awto-au/linux-rs#37 and lib/seq_buf_rs_shim.c \
+                         in linux-rs for a worked example):"
+                            .to_string(),
+                        format!(
+                            "  1. A small `{name}_shim.c` (or similar) with `#include \
+                             <linux/stdarg.h>` doing `va_start`/`va_end` around a call to \
+                             this TU's `__builtin_va_list`-taking helper for the same work, if \
+                             one exists in this file (look for a sibling function retyped from \
+                             `core::ffi::VaList` to `__builtin_va_list` by this same rule)."
+                        ),
+                        format!(
+                            "  2. If `{name}` was `EXPORT_SYMBOL_GPL`/`EXPORT_SYMBOL`'d in the \
+                             original C, carry that export to the shim's definition, not this \
+                             extern declaration."
+                        ),
+                    ] {
+                        mk_ = mk_.str_attr("doc", line);
+                    }
                 }
 
                 let mk_ = mk_.unsafety(extern_block_unsafety(self.tcfg.edition));
@@ -753,7 +828,22 @@ impl<'c> Translation<'c> {
     ) -> TranslationResult<ConvertedFunctionParam> {
         if self.ast_context.is_va_list(typ.ctype) {
             let mutbl = typ.mutability();
-            let ty = mk().abs_path_ty(vec!["core", "ffi", "VaList"]);
+            // KernelIdiomRule::VaListBuiltin (awto-au/linux-rs#37): match
+            // TypeConverter::convert's handling of va_list-typed values —
+            // `__builtin_va_list` instead of the unstable `core::ffi::VaList`
+            // for a va_list-*taking parameter (e.g. `seq_buf_vprintf`'s
+            // `args`). This function has its own hardcoded `VaList` path
+            // rather than routing through `TypeConverter::convert`, so the
+            // rule needs checking here too.
+            let ty = if self
+                .tcfg
+                .kernel_idiom_rules
+                .is_enabled(crate::KernelIdiomRule::VaListBuiltin)
+            {
+                mk().path_ty(vec!["__builtin_va_list"])
+            } else {
+                mk().abs_path_ty(vec!["core", "ffi", "VaList"])
+            };
             return Ok(ConvertedFunctionParam { mutbl, ty });
         }
 
@@ -927,7 +1017,18 @@ impl<'c> Translation<'c> {
         {
             // No `override_ty` to avoid unwanted casting.
             val = self.convert_expr(ctx, expr_id, None)?;
-            val = val.map(|val| mk_va_list_copy(self.tcfg.edition, val));
+            // KernelIdiomRule::VaListBuiltin (awto-au/linux-rs#37):
+            // `__builtin_va_list` is a plain `*mut c_void` — passing it on
+            // is just a pointer copy, unlike `core::ffi::VaList`'s
+            // `.as_va_list()`/`.clone()` dance (needed there because
+            // `VaList`/`VaListImpl` isn't `Copy`). Skip the call entirely.
+            if !self
+                .tcfg
+                .kernel_idiom_rules
+                .is_enabled(crate::KernelIdiomRule::VaListBuiltin)
+            {
+                val = val.map(|val| mk_va_list_copy(self.tcfg.edition, val));
+            }
         } else {
             val = self.convert_expr(ctx, expr_id, override_ty)?;
         }

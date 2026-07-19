@@ -2964,7 +2964,13 @@ impl<'c> Translation<'c> {
                 if self.ast_context.is_va_list(typ.ctype) {
                     // Translate `va_list` variables to the current Rust `va_list` type and omit the initializer.
                     let pat_mut = mk().mutbl().ident_pat(rust_name);
-                    let ty = mk_va_list_ty(self.tcfg.edition, None);
+                    let ty = mk_va_list_ty(
+                        self.tcfg.edition,
+                        None,
+                        self.tcfg
+                            .kernel_idiom_rules
+                            .is_enabled(crate::KernelIdiomRule::VaListBuiltin),
+                    );
                     let local_mut = mk().local(pat_mut, Some(ty), None);
 
                     return Ok(cfg::DeclStmtInfo::new(

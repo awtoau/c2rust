@@ -1,6 +1,7 @@
 use crate::c_ast::CDeclId;
 use crate::c_ast::*;
 use crate::diagnostics::TranslationResult;
+use crate::kernel_idioms::KernelIdiomRule;
 use crate::renamer::*;
 use crate::translator::variadic::mk_va_list_ty;
 use crate::TranspilerConfig;
@@ -22,6 +23,20 @@ enum FieldKey {
 pub struct TypeConverter {
     pub edition: RustEdition,
     pub translate_valist: bool,
+    /// Emit `__builtin_va_list` (c2rust's own name for `*mut
+    /// core::ffi::c_void`, matching real bindgen's `va_list` alias in
+    /// `rust/bindings/bindings_generated.rs`) instead of the unstable
+    /// `core::ffi::VaList` for every `va_list`-*typed value* (parameters,
+    /// locals, `extern "C"` decls). Gated behind
+    /// `KernelIdiomRule::VaListBuiltin` — see that variant's doc comment
+    /// and awto-au/linux-rs#37 for why: `core::ffi::VaList` is unstable
+    /// and outside this kernel's `rust_allowed_features` allow-list, while
+    /// `__builtin_va_list` is a plain pointer type needing no feature gate
+    /// at all. Does not by itself fix a true C-variadic *definition*
+    /// (`...`) — that still needs `KernelIdiomRule::VaListBuiltin`'s
+    /// shim-marker handling in `variadic.rs`, since a `...` parameter has
+    /// no value/type to redirect here.
+    pub builtin_va_list: bool,
     renamer: Renamer<CDeclId>,
     fields: HashMap<CDeclId, Renamer<FieldKey>>,
     suffix_names: HashMap<(CDeclId, &'static str), String>,
@@ -34,6 +49,9 @@ impl TypeConverter {
         TypeConverter {
             edition: tcfg.edition,
             translate_valist: tcfg.translate_valist,
+            builtin_va_list: tcfg
+                .kernel_idiom_rules
+                .is_enabled(KernelIdiomRule::VaListBuiltin),
             renamer: Renamer::type_namespace(),
             fields: HashMap::new(),
             suffix_names: HashMap::new(),
@@ -204,7 +222,7 @@ impl TypeConverter {
         ctype: CTypeId,
     ) -> TranslationResult<Box<Type>> {
         if self.translate_valist && ctxt.is_va_list(ctype) {
-            return Ok(mk_va_list_ty(self.edition, None));
+            return Ok(mk_va_list_ty(self.edition, None, self.builtin_va_list));
         }
 
         match ctxt.index(ctype).kind {
