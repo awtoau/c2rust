@@ -2835,7 +2835,6 @@ impl<'c> Translation<'c> {
                     })
                     .map(|fn_id| {
                         self.use_cleanup_guard();
-                        self.use_feature("raw_ref_op");
                         let cleanup_name = self
                             .renamer
                             .borrow()
@@ -3109,7 +3108,6 @@ impl<'c> Translation<'c> {
                     Mutability::Immutable
                 };
 
-                self.use_feature("raw_ref_op");
                 mk().set_mutbl(mutbl).raw_borrow_expr(lhs)
             }
         };
