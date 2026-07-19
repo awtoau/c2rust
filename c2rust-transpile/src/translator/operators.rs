@@ -2,7 +2,38 @@
 
 use super::*;
 
+/// Exact enclosing-function names matched by
+/// [`crate::KernelIdiomRule::RefcountOverflowDetectionWrapping`] — the
+/// four `include/linux/refcount.h` helpers whose bodies contain the
+/// deliberate "add/subtract, then test the raw result for having gone
+/// negative" overflow-detection idiom. See that rule's doc comment in
+/// `kernel_idioms.rs` for the full rationale; kept here (rather than only
+/// in `kernel_idioms.rs`) so the match list sits next to its one call site.
+const REFCOUNT_OVERFLOW_DETECTION_FNS: &[&str] = &[
+    "__refcount_add_not_zero",
+    "__refcount_add_not_zero_limited_acquire",
+    "__refcount_add",
+    "__refcount_sub_and_test",
+];
+
 impl<'c> Translation<'c> {
+    /// True if `--enable-rule=refcount-overflow-detection-wrapping` (or
+    /// `all`) is active *and* we are currently translating the body of one
+    /// of [`REFCOUNT_OVERFLOW_DETECTION_FNS`]. Gates emitting
+    /// `wrapping_add`/`wrapping_sub` for otherwise-plain signed `int`
+    /// arithmetic in [`convert_addition`](Self::convert_addition) and
+    /// [`convert_subtraction`](Self::convert_subtraction).
+    fn in_refcount_overflow_detection_fn(&self) -> bool {
+        self.tcfg
+            .kernel_idiom_rules
+            .is_enabled(crate::KernelIdiomRule::RefcountOverflowDetectionWrapping)
+            && self
+                .function_context
+                .borrow()
+                .get_name_opt()
+                .is_some_and(|name| REFCOUNT_OVERFLOW_DETECTION_FNS.contains(&name))
+    }
+
     pub fn convert_binary_expr(
         &self,
         mut ctx: ExprContext,
@@ -552,7 +583,16 @@ impl<'c> Translation<'c> {
             Ok(self.convert_pointer_offset(lhs, rhs, pointee.ctype, false, false))
         } else if let &CTypeKind::Pointer(pointee) = rhs_type {
             Ok(self.convert_pointer_offset(rhs, lhs, pointee.ctype, false, false))
-        } else if lhs_type.is_unsigned_integral_type() {
+        } else if lhs_type.is_unsigned_integral_type()
+            || (lhs_type.is_signed_integral_type() && self.in_refcount_overflow_detection_fn())
+        {
+            // The signed half of this condition only fires inside
+            // `REFCOUNT_OVERFLOW_DETECTION_FNS` bodies when
+            // `--enable-rule=refcount-overflow-detection-wrapping` is
+            // active — see `in_refcount_overflow_detection_fn`'s doc
+            // comment. Everywhere else, signed addition still falls
+            // through to the plain checked `+` in the `else` branch below,
+            // unchanged from stock c2rust behavior.
             Ok(WithStmts::new_val(mk().method_call_expr(
                 lhs,
                 "wrapping_add",
@@ -585,7 +625,12 @@ impl<'c> Translation<'c> {
             self.make_cast(ctx, CQualTypeId::new(source_type_id), expr_type_id, val)
         } else if let &CTypeKind::Pointer(pointee) = lhs_type {
             Ok(self.convert_pointer_offset(lhs, rhs, pointee.ctype, true, false))
-        } else if lhs_type.is_unsigned_integral_type() {
+        } else if lhs_type.is_unsigned_integral_type()
+            || (lhs_type.is_signed_integral_type() && self.in_refcount_overflow_detection_fn())
+        {
+            // See the matching comment in `convert_addition`: the signed
+            // half only fires inside `REFCOUNT_OVERFLOW_DETECTION_FNS`
+            // bodies with the rule enabled.
             Ok(WithStmts::new_val(mk().method_call_expr(
                 lhs,
                 "wrapping_sub",

@@ -114,6 +114,42 @@ pub enum KernelIdiomRule {
     /// against two independent real translation units (`lib/errseq.c`,
     /// `lib/debug_locks.c`); see awto-au/linux-rs#34.
     RiscvHasExtensionFallback,
+
+    /// Recognize the bodies of `include/linux/refcount.h`'s four
+    /// overflow-*detection* helpers — `__refcount_add_not_zero`,
+    /// `__refcount_add_not_zero_limited_acquire`, `__refcount_add`, and
+    /// `__refcount_sub_and_test` (matched by exact enclosing-function name,
+    /// via `Translation::function_context`) — and emit `wrapping_add`/
+    /// `wrapping_sub` for the plain signed `int` arithmetic inside them
+    /// (`old + i`, `old - i`), instead of the literal `+`/`-` c2rust emits
+    /// for signed operands everywhere else.
+    ///
+    /// `refcount_t`'s own header comment (lines 8-38) documents that this
+    /// arithmetic is a deliberate overflow-*detection* idiom, not a bug:
+    /// the counter is intentionally allowed to overflow into a negative
+    /// `int` value, and that wraparound is exactly what `old < 0 || old + i
+    /// < 0` detects, triggering `refcount_warn_saturate()`. C guarantees
+    /// (in practice, on every real compiler C code like this is written
+    /// for) this wraps rather than traps; c2rust's literal `+`/`-`
+    /// translation panics on exactly the overflow this code exists to
+    /// catch gracefully, turning a designed safety mechanism into a crash
+    /// — worse than doing nothing. Confirmed live for this project's
+    /// kernel config (`CONFIG_RUST_OVERFLOW_CHECKS=y`), and structural
+    /// (present in ~60 corpus files via `refcount_t` inlining, not a
+    /// one-off). See awto-au/linux-rs#36 and the scoping doc referenced
+    /// there.
+    ///
+    /// Deliberately scoped to these four exact function names rather than
+    /// a general "signed add/sub whose result feeds a `< 0` check" pattern
+    /// match: the general shape is not reliably distinguishable from
+    /// ordinary signed arithmetic that happens to be compared against zero
+    /// for an unrelated reason elsewhere in the corpus (see the scoping
+    /// doc's own finding that naive syntactic detection of this idiom has
+    /// an ~92% false-positive rate at the file level), and a blanket
+    /// "make all signed arithmetic wrapping" change risks masking genuine
+    /// overflow bugs elsewhere that a panic should legitimately catch.
+    /// Named-function matching is exact and can't misfire.
+    RefcountOverflowDetectionWrapping,
 }
 
 /// The active set of [`KernelIdiomRule`]s for one transpile run.
@@ -150,6 +186,7 @@ pub fn all_named_rules() -> &'static [KernelIdiomRule] {
         KernelIdiomRule::AddrLabelPlaceholder,
         KernelIdiomRule::ExportSymbol,
         KernelIdiomRule::RiscvHasExtensionFallback,
+        KernelIdiomRule::RefcountOverflowDetectionWrapping,
     ]
 }
 
