@@ -2134,15 +2134,32 @@ impl<'c> Translation<'c> {
                 integral_type: None,
                 ..
             } => {
-                self.use_feature("extern_types");
+                // Opaque/incomplete types (forward-declared struct/union/enum
+                // with no known layout) used to be translated as `extern
+                // "C" { pub type X; }`, which requires the unstable
+                // `extern_types` feature. That feature isn't in the stable
+                // set most build systems allow (e.g. Rust-for-Linux's
+                // `-Zallow-features` list), and every consumer of an opaque
+                // marker only ever touches it by pointer, never by value, so
+                // a zero-sized `#[repr(C)]` struct is a stable, ABI-safe,
+                // drop-in substitute: same "you can't construct or read
+                // this, only point at it" semantics, no unstable feature
+                // required.
                 let name = self
                     .type_converter
                     .borrow()
                     .resolve_decl_name(decl_id)
                     .unwrap();
 
-                let extern_item = mk().span(span).pub_().ty_foreign_item(name);
-                Ok(ConvertedDecl::ForeignItem(extern_item))
+                let private_field = mk()
+                    .struct_field("_private", mk().array_ty(mk().ident_ty("u8"), mk().lit_expr(0u128)));
+                let struct_item = mk()
+                    .span(span)
+                    .pub_()
+                    .call_attr("derive", vec!["Copy", "Clone"])
+                    .call_attr("repr", vec![mk().meta_path("C")])
+                    .struct_item(name, vec![private_field], false);
+                Ok(ConvertedDecl::Item(struct_item))
             }
 
             Struct {
@@ -2294,6 +2311,31 @@ impl<'c> Translation<'c> {
                 ref attrs,
                 ..
             } if has_static_duration || has_thread_duration => {
+                // Linux's `__ADDRESSABLE(sym)` macro (include/linux/compiler.h)
+                // expands to `static void * __UNIQUE_ID(addressable_##sym)
+                // __used __section(".discard.addressable") = (void
+                // *)(uintptr_t)&sym;` — a compiler-only "keep this symbol's
+                // definition" marker placed in a `.discard` section the
+                // linker throws away, not a real runtime-initialized global.
+                // The `(void *)(uintptr_t)&sym` cast isn't const-evaluable
+                // under Rust's rules (pointer-to-integer casts aren't
+                // allowed in const context), so naively translating it would
+                // route through the `.init_array` constructor-function
+                // trick below — but every C caller of this macro
+                // (`EXPORT_SYMBOL` chief among them) already keeps `sym`
+                // referenced some other way (e.g. the `.export_symbol`
+                // `global_asm!` block c2rust emits alongside it), so the
+                // `__UNIQUE_ID_addressable_*` variable itself is always
+                // dead in translated output: nothing else ever names it
+                // (that's the entire point of `__UNIQUE_ID`/`__COUNTER__`
+                // uniquing), and Rust has no `.discard`-section concept for
+                // it to usefully occupy anyway. Skip it outright rather
+                // than emitting a fabricated runtime initializer for a
+                // compile-time-only C idiom.
+                if ident.starts_with("__UNIQUE_ID_addressable_") {
+                    return Ok(ConvertedDecl::NoItem);
+                }
+
                 let new_name = &self
                     .renamer
                     .borrow()
@@ -2430,7 +2472,13 @@ impl<'c> Translation<'c> {
         span: Span,
         asm_string: &str,
     ) -> TranslationResult<ConvertedDecl> {
-        self.use_feature("asm");
+        // `core::arch::global_asm!` needs no feature gate: it (and `asm!`)
+        // has been stable since Rust 1.59 (Feb 2022). `use_feature("asm")`
+        // referred to the pre-stabilization unstable-gate name and is
+        // stale; declaring it makes output fail `-Zallow-features`-style
+        // strict-feature-list build environments (e.g. Rust-for-Linux's
+        // kernel build) for no reason, since the construct being gated is
+        // already usable without any gate at all.
 
         self.with_cur_file_item_store(|item_store| {
             item_store.add_use(true, vec!["core".into(), "arch".into()], "global_asm");

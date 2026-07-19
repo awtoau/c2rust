@@ -200,9 +200,17 @@ struct Args {
     #[clap(long, value_enum, default_value_t)]
     cross_check_backend: CrossCheckBackend,
 
-    /// Deny `unsafe_op_in_unsafe_fn` and wrap unsafe fn bodies in unsafe blocks
+    /// Opt out of denying `unsafe_op_in_unsafe_fn` and explicitly wrapping
+    /// unsafe fn bodies in `unsafe {}` blocks. On by default: relying on
+    /// pre-2024-edition implicit-unsafe-in-unsafe-fn semantics is never
+    /// required for correct output (an explicit `unsafe {}` block is valid
+    /// in every edition), and many real build environments (e.g.
+    /// Rust-for-Linux's kernel build, which passes `-Dunsafe_op_in_unsafe_fn`
+    /// unconditionally regardless of edition) reject the implicit form
+    /// outright. Pass this flag only to reproduce the older, more
+    /// C-Style/less-explicit output shape.
     #[clap(long)]
-    deny_unsafe_op_in_unsafe_fn: bool,
+    allow_implicit_unsafe_in_unsafe_fn: bool,
 
     /// Enable a named kernel-source-idiom rewrite (may be repeated, or given
     /// as a comma-separated list). Off by default: with no --enable-rule
@@ -368,7 +376,7 @@ fn main() {
         enabled_warnings: args.warn.into_iter().collect(),
         log_level: args.log_level,
         edition: args.edition,
-        deny_unsafe_op_in_unsafe_fn: args.deny_unsafe_op_in_unsafe_fn,
+        deny_unsafe_op_in_unsafe_fn: !args.allow_implicit_unsafe_in_unsafe_fn,
         kernel_idiom_rules,
     };
     // binaries imply emit-build-files
