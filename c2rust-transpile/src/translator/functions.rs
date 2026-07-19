@@ -521,6 +521,95 @@ impl<'c> Translation<'c> {
         Some(vec![mk().semi_stmt(mk().return_expr(Some(final_expr)))])
     }
 
+    /// If `func` is a direct call to RISC-V's `__riscv_has_extension_likely`
+    /// or `__riscv_has_extension_unlikely` (both `static __always_inline` in
+    /// `arch/riscv/include/asm/cpufeature-macros.h`, built entirely from
+    /// `asm goto(ALTERNATIVE(...))`), rewrite the call to
+    /// `__riscv_isa_extension_available(NULL, ext)` — the same fallback the
+    /// header's own C source uses when `CONFIG_RISCV_ALTERNATIVE` is off —
+    /// instead of calling through to the untranslatable original.
+    ///
+    /// Necessary because neither function's body can be translated at all
+    /// (asm-goto with label operands, see `assembly.rs`'s "Cannot translate
+    /// GNU asm goto" check): the normal "fall back to an extern declaration"
+    /// path in `convert_function` (this same file) still fires for them, but
+    /// the resulting extern has no real linkable symbol anywhere in the
+    /// kernel, since every C call site is `__always_inline`d away — an
+    /// unconditional `ld.lld: undefined symbol` for any translation unit
+    /// that reaches the call at runtime rather than folding it away as dead
+    /// code. Rewriting the *call site* (this function) is required rather
+    /// than substituting a body for `__riscv_has_extension_likely` itself,
+    /// because c2rust translates the public wrappers
+    /// (`riscv_has_extension_likely`/`_unlikely`) by folding away their
+    /// `if (IS_ENABLED(CONFIG_RISCV_ALTERNATIVE)) ... else ...` guard at
+    /// translation time (this kernel config has it enabled) — the call to
+    /// `__riscv_has_extension_likely`/`_unlikely` ends up baked directly
+    /// into the wrapper's translated body, with the C header's own
+    /// `__riscv_isa_extension_available` fallback branch already discarded
+    /// before this code ever sees it. There is no always-inline body left
+    /// to substitute; only the outgoing call expression can be redirected.
+    ///
+    /// Matched by exact callee name plus a 2-argument `(vendor, ext)` shape
+    /// (both functions' actual C signature) — not a general asm-goto
+    /// fallback, since there is no way to know a substitute function exists
+    /// for an arbitrary untranslatable asm-goto body. See
+    /// `KernelIdiomRule::RiscvHasExtensionFallback`'s doc comment and
+    /// awto-au/linux-rs#34 for the full rationale.
+    fn riscv_has_extension_fallback_call(
+        &self,
+        ctx: ExprContext,
+        func: CExprId,
+        args: &[CExprId],
+        call_expr_ty: CQualTypeId,
+        override_ty: Option<CQualTypeId>,
+    ) -> TranslationResult<Option<WithStmts<Box<Expr>>>> {
+        if !self
+            .tcfg
+            .kernel_idiom_rules
+            .is_enabled(crate::KernelIdiomRule::RiscvHasExtensionFallback)
+        {
+            return Ok(None);
+        }
+
+        let Some(CDeclKind::Function { name, .. }) = self.ast_context.fn_declref_decl(func) else {
+            return Ok(None);
+        };
+        if name != "__riscv_has_extension_likely" && name != "__riscv_has_extension_unlikely" {
+            return Ok(None);
+        }
+        // Real signature is `(const unsigned long vendor, const unsigned
+        // long ext)`; anything else isn't the function we think it is.
+        let [_vendor_id, ext_id] = args else {
+            return Ok(None);
+        };
+
+        let ext = self.convert_expr(ctx.used(), *ext_id, None)?;
+        let call = ext.and_then_try(|ext_expr| {
+            let null_isa_bitmap = mk().call_expr(
+                mk().abs_path_expr(vec!["core", "ptr", "null"]),
+                Vec::<Box<Expr>>::new(),
+            );
+            let ext_cast =
+                mk().cast_expr(ext_expr, mk().abs_path_ty(vec!["core", "ffi", "c_uint"]));
+            let call_expr = mk().call_expr(
+                mk().ident_expr("__riscv_isa_extension_available"),
+                vec![null_isa_bitmap, ext_cast],
+            );
+            self.make_cast(
+                ctx,
+                call_expr_ty,
+                override_ty.unwrap_or(call_expr_ty),
+                WithStmts::new_val(call_expr).set_unsafe(),
+            )
+        })?;
+
+        Ok(Some(self.convert_side_effects_expr(
+            ctx,
+            call,
+            "Function call expression is not supposed to be used",
+        )?))
+    }
+
     fn convert_function_param(
         &self,
         ctx: ExprContext,
@@ -544,6 +633,12 @@ impl<'c> Translation<'c> {
         call_expr_ty: CQualTypeId,
         override_ty: Option<CQualTypeId>,
     ) -> TranslationResult<WithStmts<Box<Expr>>> {
+        if let Some(call) =
+            self.riscv_has_extension_fallback_call(ctx, func, args, call_expr_ty, override_ty)?
+        {
+            return Ok(call);
+        }
+
         let fn_ty = self
             .ast_context
             .get_pointee_qual_type(

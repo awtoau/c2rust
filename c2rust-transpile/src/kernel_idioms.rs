@@ -88,6 +88,32 @@ pub enum KernelIdiomRule {
     /// tighten that export's license. Matches the policy documented in
     /// linux-rs's `rulesdb/rules/0001-export-symbol-gpl.toml`.
     ExportSymbol,
+
+    /// Recognize calls to RISC-V's `__riscv_has_extension_likely`/
+    /// `__riscv_has_extension_unlikely` (matched by exact callee name; both
+    /// are `static __always_inline` in `arch/riscv/include/asm/
+    /// cpufeature-macros.h`, built entirely from `asm goto(ALTERNATIVE(...))`
+    /// — RISC-V's boot-time alternative-patching idiom) and rewrite the call
+    /// to `__riscv_isa_extension_available(NULL, ext)` instead. c2rust's asm-
+    /// goto translator (see `assembly.rs`'s "Cannot translate GNU asm goto"
+    /// check) cannot translate either function's body, so without this rule
+    /// they fall back to a bare `extern "C"` declaration with no real
+    /// linkable symbol anywhere in the kernel (every C call site is
+    /// `__always_inline`d away) — an unconditional `ld.lld: undefined
+    /// symbol` at link time for any translation unit that reaches the call
+    /// at runtime. `__riscv_isa_extension_available` is exactly the fallback
+    /// `cpufeature-macros.h`'s own C source calls when
+    /// `CONFIG_RISCV_ALTERNATIVE` is off, and c2rust already translates it
+    /// correctly as a real `extern "C"` declaration (it has a genuine
+    /// out-of-line definition elsewhere in the kernel) — this rule only
+    /// changes which already-working extern gets called. Semantically
+    /// equivalent (same true/false answer for a given extension bit); the
+    /// only difference is losing the `CONFIG_RISCV_ALTERNATIVE=y`
+    /// boot-patched-branch fast path in favor of a real function call — a
+    /// real but minor perf difference, not a correctness one. Confirmed
+    /// against two independent real translation units (`lib/errseq.c`,
+    /// `lib/debug_locks.c`); see awto-au/linux-rs#34.
+    RiscvHasExtensionFallback,
 }
 
 /// The active set of [`KernelIdiomRule`]s for one transpile run.
@@ -123,6 +149,7 @@ pub fn all_named_rules() -> &'static [KernelIdiomRule] {
         KernelIdiomRule::SwapMemSwap,
         KernelIdiomRule::AddrLabelPlaceholder,
         KernelIdiomRule::ExportSymbol,
+        KernelIdiomRule::RiscvHasExtensionFallback,
     ]
 }
 
