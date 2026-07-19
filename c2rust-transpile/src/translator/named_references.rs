@@ -110,7 +110,6 @@ impl<'c> Translation<'c> {
                 // let p = &raw mut lhs;
                 // Use a raw pointer here so that it doesn't create borrow conflicts and
                 // doesn't invalidate other pointers.
-                self.use_feature("raw_ref_op");
                 let compute_ref = mk().local_stmt(Box::new(mk().local(
                     mk().ident_pat(&ptr_name),
                     None,

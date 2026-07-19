@@ -171,7 +171,6 @@ impl<'c> Translation<'c> {
                 }
             }
         } else {
-            self.use_feature("raw_ref_op");
             val = val.map(|val| mk().set_mutbl(mutbl).raw_borrow_expr(val));
 
             if is_array_decay {
@@ -564,7 +563,6 @@ impl<'c> Translation<'c> {
             // edition fact: `from_exposed_addr` doesn't exist on any
             // current compiler regardless of requested output edition, so
             // the old branch always produced code that fails to compile.
-            self.use_feature("strict_provenance");
             let fn_name = match mutability {
                 Mutability::Immutable => "with_exposed_provenance",
                 Mutability::Mutable => "with_exposed_provenance_mut",
@@ -609,7 +607,6 @@ impl<'c> Translation<'c> {
             // First convert the pointer to `usize`. Same toolchain-vs-
             // edition fix as with_exposed_provenance above: expose_addr
             // doesn't exist on any current compiler regardless of edition.
-            self.use_feature("strict_provenance");
             let method_name = "expose_provenance";
 
             let val = val.map(|val| mk().method_call_expr(val, method_name, vec![]));

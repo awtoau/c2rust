@@ -1202,7 +1202,6 @@ impl<'c> Translation<'c> {
                     // c2rust-ast-exporter added it (there's no gcc equivalent);
                     // in this case, we need to do what clang does and pass in
                     // the operand by-address instead of by-value
-                    self.use_feature("raw_ref_op");
                     out_expr = mk().mutbl().raw_borrow_expr(out_expr);
                 }
 
@@ -1216,7 +1215,6 @@ impl<'c> Translation<'c> {
                     // so we call into that one from here.
 
                     // Convert `x` into `let c2rust_output = &raw mut x; *x`
-                    self.use_feature("raw_ref_op");
                     let output_name = self.renamer.borrow_mut().pick_name("c2rust_output");
                     let output_local = mk().local(
                         mk().ident_pat(&output_name),
@@ -1245,7 +1243,6 @@ impl<'c> Translation<'c> {
                 let mut in_expr = in_expr.into_value();
 
                 if operand.mem_only {
-                    self.use_feature("raw_ref_op");
                     in_expr = mk().raw_borrow_expr(in_expr);
                 }
                 if let Some(tied_operand) = tied_operands.get(&(input_idx, false)) {
