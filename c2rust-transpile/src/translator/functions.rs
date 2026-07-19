@@ -463,33 +463,56 @@ impl<'c> Translation<'c> {
                     // functions for the real callee name) plus this
                     // function's own `EXPORT_SYMBOL_GPL`/etc, if the C
                     // original had one.
-                    for line in [
-                        format!(
-                            "C-VARIADIC DEFINITION NOT TRANSLATED: `{name}`'s C source takes \
-                             a real `...` argument list, which Rust cannot define without the \
-                             unstable `c_variadic` feature (outside this kernel's \
-                             rust_allowed_features allow-list). This binding is left as an \
-                             `extern \"C\"` declaration so existing call sites in this file \
-                             still type-check; the real definition needs a hand-written C shim."
-                        ),
-                        "Required shim shape (see awto-au/linux-rs#37 and lib/seq_buf_rs_shim.c \
-                         in linux-rs for a worked example):"
-                            .to_string(),
-                        format!(
-                            "  1. A small `{name}_shim.c` (or similar) with `#include \
-                             <linux/stdarg.h>` doing `va_start`/`va_end` around a call to \
-                             this TU's `__builtin_va_list`-taking helper for the same work, if \
-                             one exists in this file (look for a sibling function retyped from \
-                             `core::ffi::VaList` to `__builtin_va_list` by this same rule)."
-                        ),
-                        format!(
-                            "  2. If `{name}` was `EXPORT_SYMBOL_GPL`/`EXPORT_SYMBOL`'d in the \
-                             original C, carry that export to the shim's definition, not this \
-                             extern declaration."
-                        ),
-                    ] {
-                        mk_ = mk_.str_attr("doc", line);
-                    }
+                    //
+                    // This is a single `str_attr("doc", ...)` call with an
+                    // embedded `\n`-joined multi-line string (renders as
+                    // one `/** ... */` block via prettyplease), not one
+                    // call per line: `c2rust_ast_builder::Builder::
+                    // meta_namevalue` has a real, narrow, pre-existing bug
+                    // where chaining multiple `str_attr` calls on the same
+                    // builder variable leaks each call's already-
+                    // accumulated `attrs` into the *next* string literal's
+                    // own `attrs` field (`mem::take(&mut self.attrs)` in
+                    // `meta_namevalue`) — harmless for attrs that are
+                    // never printed standalone, but produces mangled
+                    // nested-attribute-on-a-literal output for `#[doc]`
+                    // specifically, since prettyplease renders `#[doc =
+                    // "..."]` specially as a `///`/`/** */` comment. Also
+                    // deliberately not using `comment_store.add_comments`
+                    // + `.span(...)` (the mechanism `mk().span(...)`
+                    // static-initializer comments elsewhere in this file
+                    // use): that path's own re-attachment traversal is
+                    // dead code upstream (see `translator/mod.rs`'s
+                    // `translate`, the whole `CommentTraverser`-driven
+                    // re-attach block is commented out with a `FIXME: We
+                    // shouldn't have to replace with an empty comment
+                    // store here` note, and `reordered_comment_store` is
+                    // built then never passed to `pprust::to_string`) —
+                    // confirmed empirically zero hits for an existing,
+                    // real use of that path
+                    // (`"Initialized in c2rust_run_static_initializers"`)
+                    // anywhere in the 603-file linux-riscv baseline
+                    // corpus. `str_attr("doc", ...)`, called once, has
+                    // neither problem.
+                    let marker = format!(
+                        "C-VARIADIC DEFINITION NOT TRANSLATED: `{name}`'s C source takes a \
+                         real `...` argument list, which Rust cannot define without the \
+                         unstable `c_variadic` feature (outside this kernel's \
+                         rust_allowed_features allow-list). This binding is left as an \
+                         `extern \"C\"` declaration so existing call sites in this file still \
+                         type-check; the real definition needs a hand-written C shim.\n\
+                         Required shim shape (see awto-au/linux-rs#37 and \
+                         lib/seq_buf_rs_shim.c in linux-rs for a worked example):\n\
+                         1. A small `{name}_shim.c` (or similar) with `#include \
+                         <linux/stdarg.h>` doing `va_start`/`va_end` around a call to this \
+                         TU's `__builtin_va_list`-taking helper for the same work, if one \
+                         exists in this file (look for a sibling function retyped from \
+                         `core::ffi::VaList` to `__builtin_va_list` by this same rule).\n\
+                         2. If `{name}` was `EXPORT_SYMBOL_GPL`/`EXPORT_SYMBOL`'d in the \
+                         original C, carry that export to the shim's definition, not this \
+                         extern declaration."
+                    );
+                    mk_ = mk_.str_attr("doc", marker);
                 }
 
                 let mk_ = mk_.unsafety(extern_block_unsafety(self.tcfg.edition));
