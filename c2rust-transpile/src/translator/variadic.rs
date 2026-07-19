@@ -22,7 +22,22 @@ macro_rules! match_or {
     };
 }
 
-pub fn mk_va_list_ty(_edition: RustEdition, lifetime: Option<&str>) -> Box<Type> {
+pub fn mk_va_list_ty(_edition: RustEdition, lifetime: Option<&str>, builtin_va_list: bool) -> Box<Type> {
+    // `KernelIdiomRule::VaListBuiltin` (awto-au/linux-rs#37): emit
+    // `__builtin_va_list` — c2rust's own name (already declared
+    // unconditionally as a plain typedef, see c_ast/mod.rs's
+    // is_builtin_va_list) for `*mut core::ffi::c_void`, matching real
+    // bindgen's `va_list` alias — instead of `core::ffi::VaList`. Every
+    // target this fork cares about (riscv64 included) represents C's
+    // va_list as a single pointer, so this is ABI-correct and, unlike
+    // `VaList`, needs no unstable feature gate at all. Only applies to
+    // va_list-*typed values* (parameters/locals/extern decls); a true
+    // `...`-variadic function *definition* has no value here to redirect
+    // and is instead handled by `register_va_decls`'s shim-marker path.
+    if builtin_va_list {
+        return mk().path_ty(vec!["__builtin_va_list"]);
+    }
+
     // `VaListImpl` was removed from core::ffi on nightlies from
     // 2025-12-07 onward (rust-lang/rust#141980) — a toolchain-version
     // fact, not an edition fact. `VaList` (its replacement) works under

@@ -150,6 +150,57 @@ pub enum KernelIdiomRule {
     /// overflow bugs elsewhere that a panic should legitimately catch.
     /// Named-function matching is exact and can't misfire.
     RefcountOverflowDetectionWrapping,
+
+    /// Fix c2rust's translation of C's `va_list`/C-variadic functions for a
+    /// kernel build whose `rust_allowed_features` allow-list has no room
+    /// for the unstable `c_variadic` feature or `core::ffi::VaList` (this
+    /// project's `scripts/Makefile.build` only permits
+    /// `arbitrary_self_types,asm_goto,generic_arg_infer,used_with_arg`).
+    /// Two independent effects, both matched by exact AST shape (a
+    /// `va_list`-typed value, or a true `...` in a function definition's
+    /// parameter list) rather than by name, so this applies uniformly
+    /// corpus-wide:
+    ///
+    /// 1. Every `va_list`-*typed value* (a function parameter like
+    ///    `seq_buf_vprintf`'s `args`, an `extern "C"` declaration's
+    ///    parameter like `vsnprintf`'s, or a local `va_list` variable) is
+    ///    translated as `__builtin_va_list` instead of `core::ffi::VaList`.
+    ///    `__builtin_va_list` is c2rust's own name (already declared
+    ///    unconditionally by every affected file as a plain typedef, see
+    ///    `c_ast::TypedAstContext::is_va_list`) for `*mut
+    ///    core::ffi::c_void` — matching real bindgen's own `va_list` alias
+    ///    in `rust/bindings/bindings_generated.rs`, and ABI-correct for
+    ///    every target this fork cares about (riscv64's `va_list` is a
+    ///    single pointer, not a struct, unlike x86-64 SysV). A plain
+    ///    pointer needs no unstable feature at all, unlike `VaList`. This
+    ///    part is a full, automatic fix — no manual follow-up needed.
+    ///
+    /// 2. A true C-variadic function *definition* (`...` in the parameter
+    ///    list, with a body — the actual variadic ABI entry point, e.g.
+    ///    `seq_buf_printf`) has no stable Rust substitute at all: `...` has
+    ///    no value for part 1's type-swap to redirect, since Rust's only
+    ///    syntax for *defining* (not just calling) a C-variadic function is
+    ///    the `c_variadic` feature itself. c2rust cannot synthesize the
+    ///    hand-written C shim this needs from the AST alone (it has no
+    ///    retained C source text to quote, only Clang's parsed
+    ///    representation) without a much larger architectural change (this
+    ///    pipeline is one C translation unit in, one Rust file out — it has
+    ///    no existing mechanism for emitting a second, sibling non-Rust
+    ///    output artifact). Instead, this rule skips translating the
+    ///    definition's body and signature and falls back to the same
+    ///    `extern "C"` foreign-item path already used for a declaration-
+    ///    only prototype, annotated with a structured `#[doc]` marker
+    ///    (renders as a `///` comment on the `extern "C" { fn ...; }` line)
+    ///    spelling out exactly what a hand-written C shim needs to
+    ///    provide, so a human/agent doesn't have to rediscover the pattern
+    ///    from scratch. See `awto-au/linux-rs#37` and linux-rs's
+    ///    `lib/seq_buf_rs_shim.c` (worktree `combined-c2rust-boot-17`) for
+    ///    the worked example this marker points at. Confirmed against the
+    ///    603-file linux-riscv baseline corpus: 40 files contain a real
+    ///    C-variadic function definition (not just a call to one — calling
+    ///    a variadic function needs no unstable feature and was already
+    ///    fine).
+    VaListBuiltin,
 }
 
 /// The active set of [`KernelIdiomRule`]s for one transpile run.
@@ -187,6 +238,7 @@ pub fn all_named_rules() -> &'static [KernelIdiomRule] {
         KernelIdiomRule::ExportSymbol,
         KernelIdiomRule::RiscvHasExtensionFallback,
         KernelIdiomRule::RefcountOverflowDetectionWrapping,
+        KernelIdiomRule::VaListBuiltin,
     ]
 }
 

@@ -822,7 +822,20 @@ impl<'a> Translation<'a> {
                 // TODO: handle or panic on structs with more than one va_list?
                 let is_va_list = self.ast_context.is_va_list(ctype);
                 let mut ty = if is_va_list {
-                    mk_va_list_ty(self.tcfg.edition, Some("a"))
+                    // KernelIdiomRule::VaListBuiltin (awto-au/linux-rs#37):
+                    // same `__builtin_va_list` swap as every other
+                    // va_list-typed-value site — see that rule's doc
+                    // comment. `__builtin_va_list` needs no lifetime
+                    // parameter (it's a plain pointer, not `VaList<'a>`),
+                    // so the `Some("a")` lifetime argument is simply
+                    // unused on that branch.
+                    mk_va_list_ty(
+                        self.tcfg.edition,
+                        Some("a"),
+                        self.tcfg
+                            .kernel_idiom_rules
+                            .is_enabled(crate::KernelIdiomRule::VaListBuiltin),
+                    )
                 } else {
                     self.convert_type(ctype)?
                 };
