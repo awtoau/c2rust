@@ -2262,12 +2262,28 @@ class TranslateASTVisitor final
 
                 // The rules for when inlined functions are externally visible
                 // are complex, so we export the visibility computed by clang.
+                //
+                // isInlineDefinitionExternallyVisible() asserts that it is
+                // called on the definition (doesThisDeclarationHaveABody() ||
+                // willHaveBody() || hasAttr<AliasAttr>()) and walks that
+                // node's getPreviousDecl() chain to find any external
+                // prototype. `FD` here is always the *canonical* decl (see
+                // the isCanonicalDecl() early-return above), which for a
+                // "prototype declared before the inline definition" TU
+                // ordering is the plain prototype, NOT the definition -- so
+                // querying FD directly silently answers "false" instead of
+                // consulting the real definition node, dropping externally-
+                // linked inline functions from the exported AST with zero
+                // diagnostic. Query the definition (already resolved above
+                // as `def`) when one exists, falling back to `FD` only when
+                // there is no definition in this TU at all (e.g. an alias).
+                const FunctionDecl *visibilityFD = def ? def : FD;
                 bool can_query_inline_visibility = is_inline &&
-                    (FD->doesThisDeclarationHaveABody() ||
-                     FD->willHaveBody() ||
-                     FD->hasAttr<AliasAttr>());
+                    (visibilityFD->doesThisDeclarationHaveABody() ||
+                     visibilityFD->willHaveBody() ||
+                     visibilityFD->hasAttr<AliasAttr>());
                 bool is_inline_externally_visible = can_query_inline_visibility
-                    && FD->isInlineDefinitionExternallyVisible();
+                    && visibilityFD->isInlineDefinitionExternallyVisible();
                 cbor_encode_boolean(array, is_inline_externally_visible);
 
                 // Encode attribute names and relevant info if supported
