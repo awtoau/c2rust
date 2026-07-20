@@ -72,6 +72,20 @@ impl<'c> NodeVisitor for CommentLocator<'c> {
     fn children(&mut self, id: SomeId) -> Vec<SomeId> {
         immediate_children_all_types(self.ast_context, id)
     }
+
+    /// A not-yet-processed top-level decl reached early as a reference (e.g.
+    /// a forward reference from an earlier top-level decl's subtree) must
+    /// stay eligible for a full, proper visit when its own turn as a root
+    /// comes around later in `locate_comments`'s loop — see `pre`/`post`'s
+    /// matching `top_decls.contains` guards, which no-op for exactly this
+    /// case. Without this, sharing one `visited` set across every top-level
+    /// decl's traversal (awtoau/c2rust#4) would permanently mark such a
+    /// decl "visited" the first time it's merely glimpsed, and it would
+    /// never be entered/walked at all when it becomes a root.
+    fn defer_visited(&mut self, id: SomeId) -> bool {
+        matches!(id, SomeId::Decl(decl_id) if self.top_decls.contains(&decl_id))
+    }
+
     fn pre(&mut self, mut id: SomeId) -> bool {
         if !self.ast_context.contains_node(id) {
             return false;
@@ -168,10 +182,41 @@ impl<'c> NodeVisitor for CommentLocator<'c> {
 
 impl<'c> Translation<'c> {
     /// Create spans for each C AST node that has a comment attached to it.
+    ///
+    /// This walks every top-level declaration's subtree in source order
+    /// (matching `c_decls_top`'s order), but shares a single `visited` set
+    /// and a single `last_id` cursor across *all* of those per-decl walks
+    /// (via `CommentLocator::visit_tree_shared`), rather than giving each
+    /// one a fresh `visited: HashSet` (see `NodeVisitor::visit_tree`).
+    ///
+    /// Any subtree reachable from more than one top-level decl (routine for
+    /// widely-used types in a large header closure) would otherwise be
+    /// walked once per top-level decl that reaches it — O(N x
+    /// shared-subtree-size) — instead of once total. See awtoau/c2rust#4.
+    ///
+    /// Sharing `visited` alone is safe for `NodeVisitor::pre`/`post`'s
+    /// comment-attachment side effects: `spans` is already a single map
+    /// threaded across every top-level decl's traversal (both before and
+    /// after this change), so attaching to the same `SomeId` from a later
+    /// decl's walk is the same idempotent `spans.entry(id)` update either
+    /// way. `visit_tree`'s own stack machine already calls `post()` (and
+    /// thus updates `last_id`) on a node reached a *second* time within a
+    /// single walk without re-running `pre()` or descending again — a
+    /// shared `visited` set just makes "second time" also cover nodes
+    /// entered under an *earlier* top-level decl's walk, which is the same
+    /// case, not a new one.
+    ///
+    /// `last_id` no longer resets to `None` at each top-level decl
+    /// boundary; it persists as "the last node visited overall" so
+    /// `check_last_for_trailing` keeps working across the seam between one
+    /// top-level decl's traversal and the next, exactly as it already does
+    /// across node boundaries within a single decl's traversal.
     pub fn locate_comments(&mut self) {
         let mut top_decls: HashSet<CDeclId> =
             self.ast_context.c_decls_top.iter().copied().collect();
         let mut spans: HashMap<SomeId, Span> = HashMap::new();
+        let mut visited: HashSet<SomeId> = HashSet::new();
+        let mut last_id: Option<SomeId> = None;
         for decl_id in &self.ast_context.c_decls_top {
             top_decls.remove(decl_id);
             let mut visitor = CommentLocator {
@@ -180,9 +225,10 @@ impl<'c> Translation<'c> {
                 comment_store: &mut self.comment_store.borrow_mut(),
                 spans: &mut spans,
                 top_decls: &top_decls,
-                last_id: None,
+                last_id,
             };
-            visitor.visit_tree(SomeId::Decl(*decl_id));
+            visitor.visit_tree_shared(SomeId::Decl(*decl_id), &mut visited);
+            last_id = visitor.last_id;
         }
         self.spans = spans;
     }

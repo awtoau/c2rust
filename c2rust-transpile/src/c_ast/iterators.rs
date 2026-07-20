@@ -525,15 +525,57 @@ pub trait NodeVisitor {
     }
     /// Visits nodes in post-order traversal.
     fn post(&mut self, _id: SomeId) {}
+    /// Return true if this node must NOT be recorded as visited when it is
+    /// merely reached as a reference (e.g. a not-yet-processed root that a
+    /// caller intends to visit properly later via its own `visit_tree`-style
+    /// call, such as `CommentLocator`'s `top_decls` guard in
+    /// `translator/comments.rs`).
+    ///
+    /// `visit_tree`/`visit_tree_shared` always call `pre()`/`post()` on such
+    /// a node when first reaching it (so any "don't visit this yet" logic
+    /// inside `pre`/`post` still runs and can no-op as today), but skip
+    /// adding it to `visited` — so it remains fresh to be entered properly
+    /// (full `pre`, descend into children, `post`) once it becomes a root in
+    /// its own right. Only matters for [`Self::visit_tree_shared`], where
+    /// `visited` outlives a single call; [`Self::visit_tree`]'s fresh
+    /// per-call set makes this a no-op there regardless of the answer.
+    fn defer_visited(&mut self, _id: SomeId) -> bool {
+        false
+    }
     /// Perform a traversal of the nodes in the AST starting at the given root node.
     /// The `pre` method will be called on each node before visiting its children, and the `post`
     /// method afterward.
     fn visit_tree(&mut self, root: SomeId) {
-        let mut stack = vec![VisitNode::new(root)];
         let mut visited = HashSet::new();
+        self.visit_tree_shared(root, &mut visited);
+    }
+
+    /// Like [`Self::visit_tree`], but takes an external `visited` set instead
+    /// of allocating a fresh one for this call.
+    ///
+    /// This lets a caller run several `visit_tree`-style traversals from
+    /// different roots (e.g. once per top-level declaration) while treating
+    /// them as one logical walk: a node already visited under an earlier
+    /// root is not re-entered (no repeated `pre()`/descent) when reached
+    /// again from a later root, exactly as it wouldn't be if reached twice
+    /// within a single `visit_tree` call. This avoids re-walking AST
+    /// subtrees shared by many roots (see awtoau/c2rust#4) while preserving
+    /// `visit_tree`'s existing per-call semantics, including that `post()`
+    /// still runs (without `pre()`/descent) on a node reached again after
+    /// having already been visited.
+    fn visit_tree_shared(&mut self, root: SomeId, visited: &mut HashSet<SomeId>) {
+        let mut stack = vec![VisitNode::new(root)];
         while let Some(mut node) = stack.pop() {
-            if !node.seen && visited.insert(node.id) {
+            // A node that was previously reached but deferred (see
+            // `defer_visited`) was never inserted into `visited`, so it
+            // looks identical to a brand-new node here and is correctly
+            // given a full `pre()`/descend/`post()` on this, its real, turn.
+            if !node.seen && !visited.contains(&node.id) {
                 let id = node.id;
+                let defer = self.defer_visited(id);
+                if !defer {
+                    visited.insert(id);
+                }
                 node.seen = true;
                 stack.push(node);
 
