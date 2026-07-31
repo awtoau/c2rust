@@ -3347,6 +3347,15 @@ static std::vector<const char *> augment_argv(int argc, const char *argv[]) {
                                            // unsigned long despite declaration
         "-extra-arg=-fparse-all-comments", // always parse comments
         "-extra-arg=-Wwrite-strings",      // string literals are constant
+        "-extra-arg=-Wno-incompatible-pointer-types-discards-qualifiers",
+        // -Wwrite-strings above makes string literals const char[N]; a
+        // caller whose own captured compile command already carries a
+        // bare -Werror then hard-fails on any existing non-const-char*
+        // callback parameter fed a literal (a valid, common C idiom) —
+        // a diagnostic that would never fire without our own injected
+        // -Wwrite-strings. Suppress specifically that diagnostic class,
+        // not any other pointer-qualifier check the caller's -Werror was
+        // checking for. See awtoau/c2rust#32 for the full repro.
         "-extra-arg=-D_FORTIFY_SOURCE=0",  // we don't want to use checked
                                            // versions of libc. without this we
         // get calls to __builtin__memcpy_chk,
