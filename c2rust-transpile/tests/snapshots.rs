@@ -11,6 +11,7 @@ use c2rust_rust_tools::RustEdition;
 use c2rust_rust_tools::RustEdition::Edition2021;
 use c2rust_rust_tools::RustEdition::Edition2024;
 use c2rust_transpile::renamer::RUST_KEYWORDS;
+use c2rust_transpile::KernelIdiomRule;
 use c2rust_transpile::ReplaceMode;
 use c2rust_transpile::TranspilerConfig;
 use itertools::Itertools;
@@ -508,6 +509,40 @@ fn test_scalar_init() {
     transpile("scalar_init.c")
         .expect_unresolved_import("f128")
         .run();
+}
+
+#[test]
+fn test_signed_integer_wrapping_rule() {
+    let temp = tempfile::tempdir().unwrap();
+    let c_path = temp.path().join("signed_integer_wrapping.c");
+    fs::write(
+        &c_path,
+        "int arithmetic(int left, int right) {\n\
+             left += right;\n\
+             left -= right;\n\
+             left *= right;\n\
+             return left + right - (left * right);\n\
+         }\n",
+    )
+    .unwrap();
+
+    let mut wrapping_config = config(Edition2021);
+    wrapping_config.kernel_idiom_rules = [KernelIdiomRule::SignedIntegerWrapping]
+        .into_iter()
+        .collect();
+    compile_and_transpile_file(&c_path, wrapping_config);
+    let wrapping_rs = fs::read_to_string(c_path.with_extension("rs")).unwrap();
+    assert!(wrapping_rs.contains("wrapping_add"));
+    assert!(wrapping_rs.contains("wrapping_sub"));
+    assert!(wrapping_rs.contains("wrapping_mul"));
+
+    let plain_path = temp.path().join("plain_signed_arithmetic.c");
+    fs::write(&plain_path, fs::read_to_string(&c_path).unwrap()).unwrap();
+    compile_and_transpile_file(&plain_path, config(Edition2021));
+    let plain_rs = fs::read_to_string(plain_path.with_extension("rs")).unwrap();
+    assert!(!plain_rs.contains("wrapping_add"));
+    assert!(!plain_rs.contains("wrapping_sub"));
+    assert!(!plain_rs.contains("wrapping_mul"));
 }
 
 #[test]
