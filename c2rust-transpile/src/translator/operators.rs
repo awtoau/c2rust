@@ -34,6 +34,12 @@ impl<'c> Translation<'c> {
                 .is_some_and(|name| REFCOUNT_OVERFLOW_DETECTION_FNS.contains(&name))
     }
 
+    fn signed_integer_wrapping_enabled(&self) -> bool {
+        self.tcfg
+            .kernel_idiom_rules
+            .is_enabled(crate::KernelIdiomRule::SignedIntegerWrapping)
+    }
+
     pub fn convert_binary_expr(
         &self,
         mut ctx: ExprContext,
@@ -410,16 +416,18 @@ impl<'c> Translation<'c> {
             _ => None,
         };
 
-        let is_unsigned_arith = op
-            .underlying_assignment()
-            .map_or(false, |op| op.is_arithmetic())
-            && compute_lhs_type_kind.is_unsigned_integral_type();
+        let is_wrapping_arith = op.underlying_assignment().map_or(false, |op| {
+            compute_lhs_type_kind.is_unsigned_integral_type()
+                || (self.signed_integer_wrapping_enabled()
+                    && compute_lhs_type_kind.is_signed_integral_type()
+                    && matches!(op, CBinOp::Add | CBinOp::Subtract | CBinOp::Multiply))
+        });
 
         let lhs_translation = if lhs_type_id.ctype != compute_lhs_type_id.ctype
             || ctx.is_used()
             || pointer_lhs.is_some()
             || is_volatile_compound_assign
-            || is_unsigned_arith
+            || is_wrapping_arith
         {
             self.name_reference_write_read(ctx, lhs)?
         } else {
@@ -446,7 +454,7 @@ impl<'c> Translation<'c> {
                         .set_unsafe(),
 
                     // Anything volatile needs to be desugared into explicit reads and writes
-                    op if is_volatile || is_unsigned_arith => {
+                    op if is_volatile || is_wrapping_arith => {
                         // Cast the lhs to the compute lhs type, do the compute, and then
                         // cast the compute result to the final lhs type.
 
@@ -555,8 +563,16 @@ impl<'c> Translation<'c> {
                 return self.convert_subtraction(ctx, expr_type_id, lhs_type, rhs_type, lhs, rhs)
             }
 
-            op if op.is_arithmetic() && is_unsigned_integral_type => {
-                mk().method_call_expr(lhs, op.wrapping_method(), vec![rhs])
+            CBinOp::Multiply
+                if is_unsigned_integral_type
+                    || (self.signed_integer_wrapping_enabled()
+                        && self
+                            .ast_context
+                            .resolve_type(expr_type_id.ctype)
+                            .kind
+                            .is_signed_integral_type()) =>
+            {
+                mk().method_call_expr(lhs, CBinOp::Multiply.wrapping_method(), vec![rhs])
             }
 
             op if op.is_arithmetic() || op.is_bitwise() || op.is_bitshift() => {
@@ -584,7 +600,9 @@ impl<'c> Translation<'c> {
         } else if let &CTypeKind::Pointer(pointee) = rhs_type {
             Ok(self.convert_pointer_offset(rhs, lhs, pointee.ctype, false, false))
         } else if lhs_type.is_unsigned_integral_type()
-            || (lhs_type.is_signed_integral_type() && self.in_refcount_overflow_detection_fn())
+            || (lhs_type.is_signed_integral_type()
+                && (self.in_refcount_overflow_detection_fn()
+                    || self.signed_integer_wrapping_enabled()))
         {
             // The signed half of this condition only fires inside
             // `REFCOUNT_OVERFLOW_DETECTION_FNS` bodies when
@@ -626,7 +644,9 @@ impl<'c> Translation<'c> {
         } else if let &CTypeKind::Pointer(pointee) = lhs_type {
             Ok(self.convert_pointer_offset(lhs, rhs, pointee.ctype, true, false))
         } else if lhs_type.is_unsigned_integral_type()
-            || (lhs_type.is_signed_integral_type() && self.in_refcount_overflow_detection_fn())
+            || (lhs_type.is_signed_integral_type()
+                && (self.in_refcount_overflow_detection_fn()
+                    || self.signed_integer_wrapping_enabled()))
         {
             // See the matching comment in `convert_addition`: the signed
             // half only fires inside `REFCOUNT_OVERFLOW_DETECTION_FNS`

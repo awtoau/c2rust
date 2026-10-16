@@ -151,6 +151,19 @@ pub enum KernelIdiomRule {
     /// Named-function matching is exact and can't misfire.
     RefcountOverflowDetectionWrapping,
 
+    /// Translate signed `+`, `-`, `*`, `+=`, `-=`, and `*=` with Rust's
+    /// wrapping operations. This rule is only valid for a source variant that
+    /// explicitly defines signed-overflow behavior, such as the Linux kernel
+    /// compilation mode using `-fno-strict-overflow`.
+    ///
+    /// It is separate from [`Self::RefcountOverflowDetectionWrapping`]:
+    /// the latter identifies four exact functions whose source expresses an
+    /// overflow-detection idiom, whereas this rule represents a property of
+    /// the whole selected compiler variant. It stays opt-in so standalone
+    /// c2rust users retain literal Rust checked arithmetic unless their
+    /// source contract supplies the same guarantee.
+    SignedIntegerWrapping,
+
     /// Fix c2rust's translation of C's `va_list`/C-variadic functions for a
     /// kernel build whose `rust_allowed_features` allow-list has no room
     /// for the unstable `c_variadic` feature or `core::ffi::VaList` (this
@@ -238,6 +251,7 @@ pub fn all_named_rules() -> &'static [KernelIdiomRule] {
         KernelIdiomRule::ExportSymbol,
         KernelIdiomRule::RiscvHasExtensionFallback,
         KernelIdiomRule::RefcountOverflowDetectionWrapping,
+        KernelIdiomRule::SignedIntegerWrapping,
         KernelIdiomRule::VaListBuiltin,
     ]
 }
